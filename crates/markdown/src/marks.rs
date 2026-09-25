@@ -145,3 +145,92 @@ pub fn set_mark_paint(cx: &mut App, paint: Painter) {
 pub(crate) fn paint_of(cx: &App, name: &str, theme: &Theme) -> Option<MarkPaint> {
     (cx.try_global::<InstalledPaint>()?.0)(name, theme)
 }
+
+/// A reader's highlight colour, by name — the set Apple Books and Notes offer.
+///
+/// A name rather than a colour value, so a highlight saved under one look
+/// paints under another. [`set_highlight_paint`] decides what each one paints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HighlightColor {
+    #[default]
+    Yellow,
+    Green,
+    Blue,
+    Pink,
+    Purple,
+}
+
+impl HighlightColor {
+    /// Every colour, in the order a picker shows them.
+    pub const ALL: [Self; 5] = [
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Pink,
+        Self::Purple,
+    ];
+
+    /// The name to store. Stable across releases; [`Self::from_name`] reads it
+    /// back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Pink => "pink",
+            Self::Purple => "purple",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.name() == name)
+    }
+}
+
+/// The wash a [`HighlightColor`] paints under text.
+pub type HighlightPaint = fn(color: HighlightColor, theme: &Theme) -> Hsla;
+
+struct InstalledHighlight(HighlightPaint);
+
+impl Global for InstalledHighlight {}
+
+/// `markdown::set_highlight_paint(cx, my_paint)` — call once at boot. Without
+/// it each colour paints [`default_highlight`].
+pub fn set_highlight_paint(cx: &mut App, paint: HighlightPaint) {
+    cx.set_global(InstalledHighlight(paint));
+}
+
+pub(crate) fn highlight_paint_of(cx: &App) -> HighlightPaint {
+    cx.try_global::<InstalledHighlight>()
+        .map_or(default_highlight, |installed| installed.0)
+}
+
+/// A [`HighlightColor`] itself, at full strength — Apple's system colour for
+/// the appearance. What a picker paints a swatch in.
+pub fn highlight_solid(color: HighlightColor, theme: &Theme) -> Hsla {
+    let dark = theme.appearance == theme::Appearance::Dark;
+    let hex = match color {
+        HighlightColor::Yellow if dark => 0xFFD60A,
+        HighlightColor::Yellow => 0xFFCC00,
+        HighlightColor::Green if dark => 0x32D74B,
+        HighlightColor::Green => 0x28CD41,
+        HighlightColor::Blue if dark => 0x0A84FF,
+        HighlightColor::Blue => 0x007AFF,
+        HighlightColor::Pink if dark => 0xFF375F,
+        HighlightColor::Pink => 0xFF2D55,
+        HighlightColor::Purple if dark => 0xBF5AF2,
+        HighlightColor::Purple => 0xAF52DE,
+    };
+    gpui::rgb(hex).into()
+}
+
+/// The shipped washes: [`highlight_solid`] at a fixed alpha, translucent so a
+/// selection over one still shows.
+pub fn default_highlight(color: HighlightColor, theme: &Theme) -> Hsla {
+    let alpha = match theme.appearance {
+        theme::Appearance::Dark => 0.32,
+        theme::Appearance::Light => 0.45,
+    };
+    highlight_solid(color, theme).opacity(alpha)
+}
