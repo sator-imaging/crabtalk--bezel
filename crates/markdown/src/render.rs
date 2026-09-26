@@ -179,7 +179,7 @@ pub enum Toggle {
 pub struct Editing<'a> {
     /// The caret and what it has selected. `None` paints neither — a document
     /// nobody is editing.
-    pub selection: Option<Selection>,
+    pub caret: Option<Caret>,
     /// The blink's lit half. A caret painted on every frame reads as frozen,
     /// and the phase belongs to whoever owns the focus.
     pub caret_on: bool,
@@ -207,7 +207,7 @@ pub struct Editing<'a> {
 impl Default for Editing<'_> {
     fn default() -> Self {
         Self {
-            selection: None,
+            caret: None,
             // Lit, so that a caller setting a selection and nothing else gets a
             // caret rather than a mystery.
             caret_on: true,
@@ -231,6 +231,345 @@ impl Default for Editing<'_> {
 /// nothing.
 #[derive(Clone, Default)]
 pub struct BlockLayouts(Rc<RefCell<Frames>>);
+
+/// A document selection together with its place in the computed visual rows.
+///
+/// Movement lives here so callers never have to coordinate a byte offset with
+/// the row containing it. In particular, a soft-wrap boundary has two visual
+/// positions with the same offset; separating those values again recreates the
+/// Home/Left and End/Right regressions this type exists to prevent.
+#[derive(Clone, Copy)]
+pub struct Caret {
+    selection: Selection,
+    visual_row: Option<VisualRow>,
+    vertical_goal: Option<VerticalGoal>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VisualRow {
+    block: usize,
+    part: Part,
+    start: usize,
+    end: usize,
+    line_start: usize,
+    wrapped_row: usize,
+}
+
+#[derive(Clone, Copy)]
+struct VerticalGoal {
+    x: Pixels,
+    row_from_caret: Pixels,
+}
+
+impl Caret {
+    pub fn new(selection: Selection) -> Self {
+        Self {
+            selection,
+            visual_row: None,
+            vertical_goal: None,
+        }
+    }
+
+    pub fn selection(self) -> Selection {
+        self.selection
+    }
+
+    pub fn head(self) -> Cursor {
+        self.selection.head
+    }
+
+    /// Replace the document position after an edit or an external selection.
+    /// The previous row describes the old shaped text and must never be
+    /// carried into the next frame merely because its byte range still fits.
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
+        self.visual_row = None;
+        self.vertical_goal = None;
+    }
+
+    pub fn clamp(&mut self, doc: &Doc) {
+        self.set_selection(self.selection.clamp(doc));
+    }
+
+    /// Attach an unbound caret to the rows computed by the current frame.
+    /// This is the only operation that chooses a row from a bare document
+    /// offset; every subsequent move follows the cached row identity.
+    pub fn settle(&mut self, layouts: &BlockLayouts) -> bool {
+        let frames = layouts.0.borrow();
+        let resolved = self
+            .visual_row
+            .and_then(|reference| frames.rows.iter().find(|row| row_is(row, reference)))
+            .filter(|row| row_contains(row, self.selection.head.offset))
+            .or_else(|| {
+                frames.rows.iter().rfind(|row| {
+                    row.block == self.selection.head.block
+                        && row.part == self.selection.head.part
+                        && row_contains(row, self.selection.head.offset)
+                })
+            })
+            .map(visual_row);
+        let changed = resolved != self.visual_row;
+        self.visual_row = resolved;
+        changed
+    }
+
+    pub fn position(self, layouts: &BlockLayouts) -> Option<(Point<Pixels>, Pixels)> {
+        let frames = layouts.0.borrow();
+        let row = frames
+            .rows
+            .iter()
+            .find(|row| self.visual_row.is_some_and(|reference| row_is(row, reference)))?;
+        Some((
+            position_in_row(&frames, row, self.selection.head.offset)?,
+            row.bounds.size.height,
+        ))
+    }
+
+    pub fn move_left(&mut self, doc: &Doc, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_horizontal(doc, layouts, extend, false)
+    }
+
+    pub fn move_right(&mut self, doc: &Doc, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_horizontal(doc, layouts, extend, true)
+    }
+
+    fn move_horizontal(
+        &mut self,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+        extend: bool,
+        right: bool,
+    ) -> bool {
+        let frames = layouts.0.borrow();
+        let Some(index) = row_index(&frames, self.visual_row) else {
+            return false;
+        };
+        let row = &frames.rows[index];
+        let head = self.selection.head;
+        let adjoining = if right {
+            frames.rows.get(index + 1).filter(|next| {
+                head.offset == row.range.end
+                    && next.block == head.block
+                    && next.part == head.part
+                    && next.range.start == head.offset
+            })
+        } else {
+            index.checked_sub(1).and_then(|previous| frames.rows.get(previous)).filter(
+                |previous| {
+                    head.offset == row.range.start
+                        && previous.block == head.block
+                        && previous.part == head.part
+                        && previous.range.end == head.offset
+                },
+            )
+        };
+        let (target, target_row) = match adjoining {
+            Some(adjoining) => (head, adjoining),
+            None => {
+                let target = if right { head.right(doc) } else { head.left(doc) }.clamp(doc);
+                let target_row = if row_contains(row, target.offset)
+                    && row.block == target.block
+                    && row.part == target.part
+                {
+                    row
+                } else {
+                    let rows: Box<dyn Iterator<Item = &PaintedRow>> = if right {
+                        Box::new(frames.rows.iter())
+                    } else {
+                        Box::new(frames.rows.iter().rev())
+                    };
+                    let Some(target_row) = rows.into_iter().find(|row| {
+                        row.block == target.block
+                            && row.part == target.part
+                            && row_contains(row, target.offset)
+                    }) else {
+                        return false;
+                    };
+                    target_row
+                };
+                (target, target_row)
+            }
+        };
+        self.move_head(target, visual_row(target_row), extend);
+        true
+    }
+
+    pub fn move_home(&mut self, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_to_row_edge(layouts, extend, false)
+    }
+
+    pub fn move_end(&mut self, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_to_row_edge(layouts, extend, true)
+    }
+
+    fn move_to_row_edge(
+        &mut self,
+        layouts: &BlockLayouts,
+        extend: bool,
+        end: bool,
+    ) -> bool {
+        let frames = layouts.0.borrow();
+        let Some(row) = row_index(&frames, self.visual_row).map(|index| &frames.rows[index]) else {
+            return false;
+        };
+        let target = Cursor::new(
+            row.block,
+            row.part,
+            if end { row.range.end } else { row.range.start },
+        );
+        self.move_head(target, visual_row(row), extend);
+        true
+    }
+
+    pub fn move_up(&mut self, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_vertical(layouts, extend, false)
+    }
+
+    pub fn move_down(&mut self, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_vertical(layouts, extend, true)
+    }
+
+    fn move_vertical(&mut self, layouts: &BlockLayouts, extend: bool, down: bool) -> bool {
+        let frames = layouts.0.borrow();
+        let Some(index) = row_index(&frames, self.visual_row) else {
+            return false;
+        };
+        let current = &frames.rows[index];
+        let Some(position) = position_in_row(&frames, current, self.selection.head.offset) else {
+            return false;
+        };
+        let from = self.vertical_goal.map_or(position, |goal| {
+            point(goal.x, position.y + goal.row_from_caret)
+        });
+        let next = match down {
+            true => frames.rows.get(index + 1),
+            false => index.checked_sub(1).and_then(|previous| frames.rows.get(previous)),
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        let Some(target) = cursor_in_row(&frames, next, from.x) else {
+            return false;
+        };
+        let Some(caret_position) = position_in_row(&frames, next, target.offset) else {
+            return false;
+        };
+        self.move_head(target, visual_row(next), extend);
+        self.vertical_goal = Some(VerticalGoal {
+            x: from.x,
+            row_from_caret: next.bounds.origin.y - caret_position.y,
+        });
+        true
+    }
+
+    pub fn move_word_left(&mut self, doc: &Doc, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_logically(doc, layouts, extend, false, Cursor::word_left)
+    }
+
+    pub fn move_word_right(&mut self, doc: &Doc, layouts: &BlockLayouts, extend: bool) -> bool {
+        self.move_logically(doc, layouts, extend, true, Cursor::word_right)
+    }
+
+    pub fn move_document_start(
+        &mut self,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+        extend: bool,
+    ) -> bool {
+        self.move_logically(doc, layouts, extend, false, |_, doc| Selection::all(doc).anchor)
+    }
+
+    pub fn move_document_end(
+        &mut self,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+        extend: bool,
+    ) -> bool {
+        self.move_logically(doc, layouts, extend, true, |_, doc| Selection::all(doc).head)
+    }
+
+    fn move_logically(
+        &mut self,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+        extend: bool,
+        forward: bool,
+        target: impl FnOnce(Cursor, &Doc) -> Cursor,
+    ) -> bool {
+        let target = target(self.selection.head, doc).clamp(doc);
+        let frames = layouts.0.borrow();
+        let rows: Box<dyn Iterator<Item = &PaintedRow>> = if forward {
+            Box::new(frames.rows.iter())
+        } else {
+            Box::new(frames.rows.iter().rev())
+        };
+        let Some(row) = rows.into_iter().find(|row| {
+            row.block == target.block
+                && row.part == target.part
+                && row_contains(row, target.offset)
+        }) else {
+            return false;
+        };
+        self.move_head(target, visual_row(row), extend);
+        true
+    }
+
+    pub fn select_at(
+        &mut self,
+        point: Point<Pixels>,
+        click_count: usize,
+        extend: bool,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+    ) -> bool {
+        let frames = layouts.0.borrow();
+        let Some(row) = row_at(&frames, point) else {
+            return false;
+        };
+        let Some(hit) = cursor_in_row(&frames, row, point.x) else {
+            return false;
+        };
+        self.selection = match click_count {
+            _ if extend => self.selection.extend_to(hit),
+            1 => Selection::at(hit),
+            2 => Selection::new(hit.word_left(doc), hit.word_right(doc)),
+            _ => Selection::new(hit.home(), hit.end(doc)),
+        }
+        .clamp(doc);
+        self.visual_row = Some(visual_row(row));
+        self.vertical_goal = None;
+        true
+    }
+
+    pub fn extend_at(
+        &mut self,
+        point: Point<Pixels>,
+        doc: &Doc,
+        layouts: &BlockLayouts,
+    ) -> bool {
+        let frames = layouts.0.borrow();
+        let Some(row) = row_at(&frames, point) else {
+            return false;
+        };
+        let Some(hit) = cursor_in_row(&frames, row, point.x) else {
+            return false;
+        };
+        self.selection = self.selection.extend_to(hit).clamp(doc);
+        self.visual_row = Some(visual_row(row));
+        self.vertical_goal = None;
+        true
+    }
+
+    fn move_head(&mut self, head: Cursor, row: VisualRow, extend: bool) {
+        self.selection = if extend {
+            self.selection.extend_to(head)
+        } else {
+            Selection::at(head)
+        };
+        self.visual_row = Some(row);
+        self.vertical_goal = None;
+    }
+}
 
 #[derive(Default)]
 struct Frames {
@@ -282,19 +621,7 @@ impl BlockLayouts {
     /// rather than doing nothing.
     pub fn hit(&self, point: Point<Pixels>) -> Option<Cursor> {
         let frames = self.0.borrow();
-        if let Some(row) = frames.rows.iter().find(|row| row.bounds.contains(&point)) {
-            return cursor_in_row(&frames, row, point.x);
-        }
-        frames
-            .rows
-            .iter()
-            .min_by_key(|row| {
-                let bounds = row.bounds;
-                let above = (bounds.origin.y - point.y).abs();
-                let below = (bounds.origin.y + bounds.size.height - point.y).abs();
-                f32::from(above.min(below)) as i64
-            })
-            .and_then(|row| cursor_in_row(&frames, row, point.x))
+        cursor_in_row(&frames, row_at(&frames, point)?, point.x)
     }
 
     /// Where a position painted last frame, and how tall its line is.
@@ -528,6 +855,46 @@ fn row_contains(row: &PaintedRow, offset: usize) -> bool {
     row.range.start <= offset && offset <= row.range.end
 }
 
+fn visual_row(row: &PaintedRow) -> VisualRow {
+    VisualRow {
+        block: row.block,
+        part: row.part,
+        start: row.range.start,
+        end: row.range.end,
+        line_start: row.line_start,
+        wrapped_row: row.wrapped_row,
+    }
+}
+
+fn row_is(row: &PaintedRow, reference: VisualRow) -> bool {
+    row.block == reference.block
+        && row.part == reference.part
+        && row.range.start == reference.start
+        && row.range.end == reference.end
+        && row.line_start == reference.line_start
+        && row.wrapped_row == reference.wrapped_row
+}
+
+fn row_index(frames: &Frames, reference: Option<VisualRow>) -> Option<usize> {
+    let reference = reference?;
+    frames.rows.iter().position(|row| row_is(row, reference))
+}
+
+fn row_at(frames: &Frames, point: Point<Pixels>) -> Option<&PaintedRow> {
+    frames
+        .rows
+        .iter()
+        .find(|row| row.bounds.contains(&point))
+        .or_else(|| {
+            frames.rows.iter().min_by_key(|row| {
+                let bounds = row.bounds;
+                let above = (bounds.origin.y - point.y).abs();
+                let below = (bounds.origin.y + bounds.size.height - point.y).abs();
+                f32::from(above.min(below)) as i64
+            })
+        })
+}
+
 fn cursor_in_row(frames: &Frames, row: &PaintedRow, x: Pixels) -> Option<Cursor> {
     let painted = &frames.texts[row.painted];
     let line = painted
@@ -543,6 +910,25 @@ fn cursor_in_row(frames: &Frames, row: &PaintedRow, x: Pixels) -> Option<Cursor>
         row.block,
         row.part,
         (row.line_start + offset).min(row.range.end),
+    ))
+}
+
+/// Resolve the caret inside its recorded visual row. Using the row's shaped
+/// line is required here: `TextLayout::position_for_index` chooses the first
+/// side of a soft-wrap boundary and silently discards the caret's row.
+fn position_in_row(frames: &Frames, row: &PaintedRow, offset: usize) -> Option<Point<Pixels>> {
+    let painted = &frames.texts[row.painted];
+    let line = painted
+        .layout
+        .line_layout_for_index(row.line_start - painted.range.start)?;
+    let shaped = &line.unwrapped_layout;
+    let row_start = row.range.start - row.line_start;
+    let offset = offset
+        .saturating_sub(row.line_start)
+        .clamp(row_start, row.range.end - row.line_start);
+    Some(point(
+        row.bounds.origin.x + shaped.x_for_index(offset) - shaped.x_for_index(row_start),
+        row.bounds.origin.y,
     ))
 }
 
@@ -595,7 +981,7 @@ fn record_rows(
 struct Overlay<'a> {
     block: usize,
     part: Part,
-    selection: Option<Selection>,
+    caret: Option<Caret>,
     caret_on: bool,
     layouts: Option<&'a BlockLayouts>,
     /// Ranges washed under the text, in the order the caller gave them.
@@ -632,15 +1018,15 @@ impl<'a> Overlay<'a> {
 
     /// The caret's byte offset, if the head is in *this* text.
     fn caret(&self) -> Option<usize> {
-        self.selection
-            .map(|selection| selection.head)
+        self.caret
+            .map(Caret::head)
             .filter(|head| head.block == self.block && head.part == self.part)
             .map(|head| head.offset)
     }
 
     /// The selected slice of this text, clipped to it.
     fn selected(&self, len: usize) -> Option<Range<usize>> {
-        self.clip(self.selection?, len)
+        self.clip(self.caret?.selection(), len)
     }
 
     /// The annotated slices of this text, already resolved to their paint —
@@ -681,7 +1067,11 @@ impl<'a> Overlay<'a> {
     /// picture — falls inside the selection, and so should show that it is
     /// going to be taken.
     fn covers_block(&self) -> bool {
-        let Some(selection) = self.selection.filter(|s| !s.is_collapsed()) else {
+        let Some(selection) = self
+            .caret
+            .map(Caret::selection)
+            .filter(|selection| !selection.is_collapsed())
+        else {
             return false;
         };
         let (start, end) = selection.ordered();
@@ -734,7 +1124,7 @@ pub fn render(doc: &Doc, caption: Caption, window: &mut Window, cx: &mut App) ->
 /// quads is not worth a second renderer.
 pub fn render_with(doc: &Doc, editing: Editing, window: &mut Window, cx: &mut App) -> AnyElement {
     let Editing {
-        selection,
+        caret,
         caret_on,
         layouts,
         annotations,
@@ -772,7 +1162,7 @@ pub fn render_with(doc: &Doc, editing: Editing, window: &mut Window, cx: &mut Ap
         let overlay = Overlay {
             block: ix,
             part: Part::Body,
-            selection,
+            caret,
             caret_on,
             layouts,
             annotations,
@@ -1300,6 +1690,7 @@ fn painted_text(
     let selection_color = theme.selection;
     let annotated = overlay.annotated(len, theme);
     let layouts = overlay.layouts.cloned();
+    let visual_caret = overlay.caret;
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
@@ -1335,11 +1726,13 @@ fn painted_text(
                     ));
                 }
             }
-            if let Some(offset) = caret
-                && let Some(head) = layout.position_for_index(offset)
+            if caret.is_some()
+                && let Some(caret) = visual_caret
+                && let Some(layouts) = &layouts
+                && let Some((head, line_height)) = caret.position(layouts)
             {
                 window.paint_quad(quad(
-                    caret_quad(head, size, layout.line_height()),
+                    caret_quad(head, size, line_height),
                     px(0.0),
                     caret_color,
                     px(0.0),
@@ -1461,7 +1854,7 @@ fn range_rects(
 /// source view that scrolled sideways would hide most of it.
 pub fn render_source(code: &str, editing: Editing, cx: &mut App) -> AnyElement {
     let Editing {
-        selection,
+        caret,
         caret_on,
         layouts,
         annotations,
@@ -1482,7 +1875,7 @@ pub fn render_source(code: &str, editing: Editing, cx: &mut App) -> AnyElement {
     let overlay = Overlay {
         block: 0,
         part: Part::Code,
-        selection,
+        caret,
         caret_on,
         layouts,
         annotations,
@@ -1611,6 +2004,7 @@ fn code_lines(
     let caret = overlay.caret_painted();
     let selected = overlay.selected(code.len());
     let sink = overlay.layouts.cloned();
+    let visual_caret = overlay.caret;
     let code_size = typography.code.size();
     let annotated = overlay.annotated(code.len(), theme);
     let (caret_color, selection_color) = (theme.caret, theme.selection);
@@ -1655,11 +2049,15 @@ fn code_lines(
                         }
                     }
                 }
-                if let Some(offset) = caret.filter(|at| span.contains(at) || *at == span.end)
-                    && let Some(head) = layout.position_for_index(offset - span.start)
+                if caret
+                    .filter(|at| span.contains(at) || *at == span.end)
+                    .is_some()
+                    && let Some(caret) = visual_caret
+                    && let Some(sink) = &sink
+                    && let Some((head, line_height)) = caret.position(sink)
                 {
                     window.paint_quad(quad(
-                        caret_quad(head, code_size, layout.line_height()),
+                        caret_quad(head, code_size, line_height),
                         px(0.0),
                         caret_color,
                         px(0.0),
