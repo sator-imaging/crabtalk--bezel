@@ -15,8 +15,8 @@ use gpui::{
     KeyContext, MouseButton, Render, Styled as _, Task, Window, canvas, div, prelude::*,
 };
 use markdown::{
-    Annotation, Block, BlockKind, BlockLayouts, Cursor, Doc, Form, Mark, Part, Selection, Splice,
-    Text, edit, edit::shortcut,
+    Annotation, Block, BlockKind, BlockLayouts, Caret, Cursor, Doc, Form, Mark, Part, Selection,
+    Splice, Text, edit, edit::shortcut,
 };
 use motion::Painter;
 use std::{ops::Range, time::Duration};
@@ -215,34 +215,6 @@ fn ensure_block(doc: &mut Doc) -> bool {
     true
 }
 
-fn line_home(at: Cursor, doc: &Doc) -> Cursor {
-    let Some(text) = doc
-        .blocks
-        .get(at.block)
-        .and_then(|block| block.text_at(at.part))
-    else {
-        return at.home();
-    };
-    Cursor {
-        offset: ui::input::line_start(&text.text, at.offset.min(text.text.len())),
-        ..at
-    }
-}
-
-fn line_end(at: Cursor, doc: &Doc) -> Cursor {
-    let Some(text) = doc
-        .blocks
-        .get(at.block)
-        .and_then(|block| block.text_at(at.part))
-    else {
-        return at.end(doc);
-    };
-    Cursor {
-        offset: ui::input::line_end(&text.text, at.offset.min(text.text.len())),
-        ..at
-    }
-}
-
 /// The document a source view is edited as: one fence holding the markdown.
 ///
 /// A fence rather than a paragraph because a fence is the block whose caret
@@ -276,9 +248,10 @@ pub struct Editor {
     /// block holding the markdown, so every operation below that is about
     /// *blocks* asks [`Editor::blocks`] first.
     mode: Mode,
-    /// Collapsed for an ordinary caret, so there is one position here rather
-    /// than a caret and a range that can disagree.
-    selection: Selection,
+    /// The document selection and its identity in the computed visual rows.
+    /// Movement goes through this value so no editor handler can update one
+    /// without the other.
+    caret: Caret,
     focus_handle: FocusHandle,
     /// The IME composition range within the caret's text, underlined while it
     /// is being composed.
@@ -344,8 +317,6 @@ pub struct Editor {
     /// Where the gutter handle was placed this frame, so the frame after can
     /// tell whether the block moved out from under it.
     handle_at: Option<gpui::Point<gpui::Pixels>>,
-    /// The column and row held across consecutive vertical moves.
-    goal: Option<VerticalGoal>,
     /// The size the app set this document in, in points, or `None` to follow
     /// the app's own text size. Absolute rather than a factor over the ladder,
     /// so moving the interface size leaves a document set to 16pt at 16pt.
@@ -355,13 +326,6 @@ pub struct Editor {
     text_size: Option<f32>,
     /// The directory relative image paths resolve against.
     base: Option<std::path::PathBuf>,
-}
-
-#[derive(Clone, Copy)]
-struct VerticalGoal {
-    x: gpui::Pixels,
-    /// Relative to the caret's painted position so scrolling cannot change the row.
-    row_from_caret: gpui::Pixels,
 }
 
 impl Editor {
@@ -374,7 +338,7 @@ impl Editor {
             // Clamped, not defaulted: a document opening on a fence or a table
             // has no body at block zero, and a caret claiming one resolves
             // against nothing until something moves it.
-            selection: Selection::at(Cursor::default().clamp(&doc)),
+            caret: Caret::new(Selection::at(Cursor::default().clamp(&doc))),
             doc,
             chrome: Chrome::default(),
             mode: Mode::default(),
@@ -402,7 +366,6 @@ impl Editor {
             over_text: false,
             scroll: None,
             reveal: false,
-            goal: None,
             handle_at: None,
             text_size: None,
             base: None,
@@ -426,7 +389,7 @@ impl Editor {
         self.marks = marks;
         self.doc = markdown::parse_with(&source, &self.marks);
         ensure_block(&mut self.doc);
-        self.selection = self.selection.clamp(&self.doc);
+        self.caret.clamp(&self.doc);
         self
     }
 
@@ -546,7 +509,7 @@ impl Editor {
         };
         // Left set when the caret has not painted: a block with no text at all
         // never answers, and the next move is what gets it back.
-        let Some((at, line)) = self.layouts.position(self.selection.head) else {
+        let Some((at, line)) = self.caret.position(&self.layouts) else {
             return;
         };
         self.reveal = false;
@@ -573,7 +536,7 @@ impl Editor {
     }
 
     pub fn selection(&self) -> Selection {
-        self.selection
+        self.caret.selection()
     }
 
     /// Put the selection somewhere — what a thread in a sidebar does when it is
@@ -582,7 +545,7 @@ impl Editor {
     /// Clamped, because the caller's range came from somewhere the document may
     /// have moved on from.
     pub fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
-        self.selection = selection.clamp(&self.doc);
+        self.caret.set_selection(selection.clamp(&self.doc));
         self.history.interrupt();
         self.reveal = true;
         self.caret_moved();
@@ -608,10 +571,10 @@ impl Editor {
     pub fn selection_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
         // The head alone. A bar centred over the whole selection wants
         // `layouts().rects(selection)`, which is every painted row of it.
-        if self.selection.is_collapsed() {
+        if self.caret.selection().is_collapsed() {
             return None;
         }
-        let (point, line_height) = self.layouts.position(self.selection.head)?;
+        let (point, line_height) = self.caret.position(&self.layouts)?;
         Some(gpui::Bounds::new(
             point,
             gpui::size(gpui::px(0.0), line_height),
@@ -675,7 +638,6 @@ impl Editor {
     /// Vertical motion records its next goal after moving the caret.
     fn caret_moved(&mut self) {
         self.blink = None;
-        self.goal = None;
     }
 
     /// Blink the caret for as long as the document holds focus.
@@ -697,25 +659,13 @@ impl Editor {
 
     /// Where typing would land — the moving end of the selection.
     fn cursor(&self) -> Cursor {
-        self.selection.head
+        self.caret.head()
     }
 
     /// Put the caret somewhere, collapsed.
     fn place(&mut self, cursor: Cursor) {
-        self.selection = Selection::at(cursor.clamp(&self.doc));
-    }
-
-    /// Move the head, extending the selection or collapsing it — the one path
-    /// every motion key takes, so shift is a flag rather than a second handler.
-    fn moved(
-        &mut self,
-        extend: bool,
-        to: impl FnOnce(Cursor, &Doc) -> Cursor,
-        cx: &mut Context<Self>,
-    ) {
-        let head = to(self.selection.head, &self.doc).clamp(&self.doc);
-        self.head_to(head, extend);
-        cx.notify();
+        self.caret
+            .set_selection(Selection::at(cursor.clamp(&self.doc)));
     }
 
     /// The visual-row edge when it has painted, or the hard-line edge before
@@ -751,7 +701,7 @@ impl Editor {
         to: impl FnOnce(Cursor, &Doc) -> Cursor,
         cx: &mut Context<Self>,
     ) {
-        if !self.selection.is_collapsed() {
+        if !self.caret.selection().is_collapsed() {
             return self.delete_back(cx);
         }
         let at = self.cursor();
@@ -768,27 +718,69 @@ impl Editor {
             let splice = this
                 .doc
                 .replace(Selection::new(target, at), Text::default());
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             this.track_slash("", painter);
             vec![Delta::Spliced(splice)]
         });
     }
 
-    fn head_to(&mut self, head: Cursor, extend: bool) {
-        self.selection = if extend {
-            self.selection.extend_to(head)
-        } else {
-            Selection::at(head)
-        };
-        // A motion ends the undo group: typing a word, moving away and typing
-        // again must not undo as one step across two places. It also spends any
-        // stored mark and any open paste menu, both of which belonged to the
-        // spot the caret just left.
+    /// Complete a movement after [`Caret`] has updated both its document and
+    /// visual positions. Keeping these editor concerns outside `Caret` avoids
+    /// teaching the markdown layer about history, menus, or scrolling.
+    fn finish_caret_motion(&mut self, cx: &mut Context<Self>) {
         self.history.interrupt();
         self.stored.clear();
         self.pasted = None;
         self.reveal = true;
         self.caret_moved();
+        cx.notify();
+    }
+
+    fn horizontal(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
+        let moved = if right {
+            self.caret.move_right(&self.doc, &self.layouts, extend)
+        } else {
+            self.caret.move_left(&self.doc, &self.layouts, extend)
+        };
+        if moved {
+            self.finish_caret_motion(cx);
+        }
+    }
+
+    fn row_edge(&mut self, end: bool, extend: bool, cx: &mut Context<Self>) {
+        let moved = if end {
+            self.caret.move_end(&self.layouts, extend)
+        } else {
+            self.caret.move_home(&self.layouts, extend)
+        };
+        if moved {
+            self.finish_caret_motion(cx);
+        }
+    }
+
+    fn word(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
+        let moved = if right {
+            self.caret.move_word_right(&self.doc, &self.layouts, extend)
+        } else {
+            self.caret.move_word_left(&self.doc, &self.layouts, extend)
+        };
+        if moved {
+            self.finish_caret_motion(cx);
+        }
+    }
+
+    fn document_edge(&mut self, end: bool, extend: bool, cx: &mut Context<Self>) {
+        let moved = if end {
+            self.caret
+                .move_document_end(&self.doc, &self.layouts, extend)
+        } else {
+            self.caret
+                .move_document_start(&self.doc, &self.layouts, extend)
+        };
+        if moved {
+            self.finish_caret_motion(cx);
+        }
     }
 
     /// Every mutation goes through here, so none of them can forget to record
@@ -802,8 +794,13 @@ impl Editor {
         // Any edit answers the paste menu by ignoring it — whatever it offered
         // was about a block that no longer holds only the link.
         self.pasted = None;
-        self.history
-            .record(kind, self.mode, &self.doc, self.selection, &self.anchors);
+        self.history.record(
+            kind,
+            self.mode,
+            &self.doc,
+            self.caret.selection(),
+            &self.anchors,
+        );
         // A list rather than one: Enter clears a selection *and* splits, and an
         // anchor mapped through only half of that lands in the wrong place.
         // Source mode maps nothing: its deltas are about one fence, and an
@@ -824,12 +821,12 @@ impl Editor {
         // Deleting the last block is the other way to an empty document, and
         // the caret belongs at the start of whatever replaces it.
         if ensure_block(&mut self.doc) {
-            self.selection = Selection::at(Cursor::default());
+            self.caret.set_selection(Selection::at(Cursor::default()));
         }
         if !self.blocks() {
             self.ensure_source();
         }
-        self.history.landed(kind, self.selection);
+        self.history.landed(kind, self.caret.selection());
         // Typing moves the caret as surely as an arrow key does, and a split
         // moves it onto a block that does not exist until this frame paints.
         self.reveal = true;
@@ -844,8 +841,6 @@ impl Editor {
     /// a code block's lines and a table's rows are all the same case and none
     /// needs counting — but geometry walked in document order rather than
     /// hit-tested, which is [`markdown::BlockLayouts::step_row`]'s whole point.
-    /// Falls back to the block-wise motion off either end of the document, and
-    /// on the first frame, when nothing has painted to walk.
     fn vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
         // Up and down walk a menu while it is open, not the document.
         let delta = if down { 1 } else { -1 };
@@ -857,56 +852,16 @@ impl Editor {
             slash.step(delta);
             return cx.notify();
         }
-        let head = self.selection.head;
-        let Some((at, _)) = self.layouts.position(head) else {
-            return self.moved(
-                extend,
-                |at, doc| if down { at.down(doc) } else { at.up(doc) },
-                cx,
-            );
+        let moved = if down {
+            self.caret.move_down(&self.layouts, extend)
+        } else {
+            self.caret.move_up(&self.layouts, extend)
         };
-        let from = self
-            .goal
-            .map_or(at, |goal| gpui::point(goal.x, at.y + goal.row_from_caret));
-        match self.layouts.step_row(head, from, down) {
-            Some((to, row)) => {
-                self.head_to(to.clamp(&self.doc), extend);
-                self.goal = self
-                    .layouts
-                    .position(self.cursor())
-                    .map(|(caret, _)| VerticalGoal {
-                        x: from.x,
-                        row_from_caret: row - caret.y,
-                    });
-            }
-            // Off the top is the start of the document and off the bottom is
-            // its end, which is what every native field does.
-            None => {
-                // Except where the end is a block a caret cannot carry on from,
-                // and going down means the paragraph after it — the one a click
-                // below the document asks for by the same rule.
-                if down
-                    && !extend
-                    && self.cursor().block + 1 == self.doc.blocks.len()
-                    && self.append_tail(cx)
-                {
-                    return;
-                }
-                let to = if down {
-                    head.down(&self.doc)
-                } else {
-                    head.up(&self.doc)
-                };
-                self.head_to(to.clamp(&self.doc), extend);
-                // The column outlives the trip to either end, so coming back
-                // retraces the path.
-                self.goal = Some(VerticalGoal {
-                    x: from.x,
-                    row_from_caret: gpui::Pixels::ZERO,
-                });
-            }
+        if moved {
+            self.finish_caret_motion(cx);
+        } else if down && !extend && self.cursor().block + 1 == self.doc.blocks.len() {
+            self.append_tail(cx);
         }
-        cx.notify();
     }
 
     /// The document as markdown — normalized, because that is the form that
@@ -932,7 +887,7 @@ impl Editor {
     pub fn formatting(&self) -> Formatting {
         let at = self.cursor();
         let marks = if self.blocks() {
-            let mut marks = self.doc.marks(self.selection);
+            let mut marks = self.doc.marks(self.caret.selection());
             // A stored mark is one cmd-B has already taken and nothing has
             // spent yet, so the button that took it stays lit.
             for mark in &self.stored {
@@ -952,7 +907,7 @@ impl Editor {
                 .blocks
                 .get(at.block)
                 .and_then(|block| crate::slash::label(&block.kind)),
-            fenceable: self.blocks() && fenceable(&self.doc, self.selection),
+            fenceable: self.blocks() && fenceable(&self.doc, self.caret.selection()),
         }
     }
 
@@ -972,12 +927,13 @@ impl Editor {
             EditKind::Structure,
             self.mode,
             &self.doc,
-            self.selection,
+            self.caret.selection(),
             &self.anchors,
         );
         self.dismiss_menus();
         self.switch(mode);
-        self.history.landed(EditKind::Structure, self.selection);
+        self.history
+            .landed(EditKind::Structure, self.caret.selection());
         self.reveal = true;
         self.caret_moved();
         cx.emit(EditorEvent::ModeChanged(mode));
@@ -993,14 +949,15 @@ impl Editor {
                 let (source, offset) =
                     markdown::serialize_at(&self.doc, self.cursor(), &self.marks);
                 self.doc = source_doc(&source);
-                self.selection = Selection::at(Cursor::new(0, Part::Code, offset));
+                self.caret
+                    .set_selection(Selection::at(Cursor::new(0, Part::Code, offset)));
             }
             Mode::Blocks => {
                 let (doc, at) =
                     markdown::parse_at(self.source_text(), self.cursor().offset, &self.marks);
                 self.doc = doc;
                 ensure_block(&mut self.doc);
-                self.selection = Selection::at(at.clamp(&self.doc));
+                self.caret.set_selection(Selection::at(at.clamp(&self.doc)));
                 for anchor in &mut self.anchors {
                     anchor.range = anchor.range.clamp(&self.doc);
                 }
@@ -1060,9 +1017,10 @@ impl Editor {
             .map(|text| text.text.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        let offset = self.selection.head.offset.min(source.len());
+        let offset = self.caret.head().offset.min(source.len());
         self.doc = source_doc(&source);
-        self.selection = Selection::at(Cursor::new(0, Part::Code, offset));
+        self.caret
+            .set_selection(Selection::at(Cursor::new(0, Part::Code, offset)));
     }
 
     /// Shut everything floating. A switch of mode is a new document as far as
@@ -1093,8 +1051,9 @@ impl Editor {
                     mark,
                 });
             }
-            let splice = this.doc.replace(this.selection, typed);
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            let splice = this.doc.replace(this.caret.selection(), typed);
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             let shortcut = this.apply_shortcut();
             let promoted = this.promote_quote_marker();
             let inline = this.apply_inline_rule();
@@ -1180,8 +1139,9 @@ impl Editor {
             this.doc
                 .edit_at(at, |text| text.remove(at.offset..caret.offset));
             this.doc.set_kind(at.block, kind);
-            this.selection =
-                Selection::at(Cursor::new(at.block, Part::Body, at.offset).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(at.block, Part::Body, at.offset).clamp(&this.doc),
+            ));
             vec![Delta::Spliced(Splice {
                 removed: Selection::new(at, caret),
                 caret: at,
@@ -1222,8 +1182,9 @@ impl Editor {
             text.remove(open);
             text.toggle(inner.start - width..inner.end - width, mark);
         });
-        self.selection =
-            Selection::at(Cursor::new(at.block, at.part, at.offset - 2 * width).clamp(&self.doc));
+        self.caret.set_selection(Selection::at(
+            Cursor::new(at.block, at.part, at.offset - 2 * width).clamp(&self.doc),
+        ));
         // In the order the two removals went. The opening delimiter is ahead of
         // the closing one, so taking that one first left its offsets standing.
         vec![Self::taken(at, closing), Self::taken(at, opening)]
@@ -1245,14 +1206,14 @@ impl Editor {
         // With nothing selected there is no range to mark, so the mark waits
         // for the next character — ProseMirror's stored marks, and the only way
         // cmd-B before typing can mean anything.
-        if self.selection.is_collapsed() && !leaving_code {
+        if self.caret.selection().is_collapsed() && !leaving_code {
             match self.stored.iter().position(|stored| *stored == mark) {
                 Some(ix) => drop(self.stored.remove(ix)),
                 None => self.stored.push(mark),
             }
             return cx.notify();
         }
-        let selection = self.selection;
+        let selection = self.caret.selection();
         self.edit(EditKind::Structure, cx, |this| {
             // Code over more than one line is a fence, which is the only shape
             // markdown has for it, and the same key is the way back out.
@@ -1268,12 +1229,14 @@ impl Editor {
             };
             if matches!(mark, Mark::Code) {
                 if let Some(head) = this.doc.unfence(selection) {
-                    this.selection = Selection::at(head.clamp(&this.doc));
+                    this.caret
+                        .set_selection(Selection::at(head.clamp(&this.doc)));
                     return refenced(&this.doc, head);
                 }
                 if fenceable(&this.doc, selection) {
                     let head = this.doc.fence(selection);
-                    this.selection = Selection::at(head.clamp(&this.doc));
+                    this.caret
+                        .set_selection(Selection::at(head.clamp(&this.doc)));
                     return refenced(&this.doc, head);
                 }
             }
@@ -1306,8 +1269,9 @@ impl Editor {
         // menu takes, so a `## ` and a menu pick land in one place.
         self.doc.edit_at(at, |text| text.remove(0..len));
         self.doc.set_kind(at.block, hit.apply(Text::default()));
-        self.selection =
-            Selection::at(Cursor::new(at.block, Part::Body, at.offset - len).clamp(&self.doc));
+        self.caret.set_selection(Selection::at(
+            Cursor::new(at.block, Part::Body, at.offset - len).clamp(&self.doc),
+        ));
         // The transformation is its own step: undo after typing `## Title`
         // should give back the heading, not the paragraph before the hashes.
         self.history.interrupt();
@@ -1341,9 +1305,9 @@ impl Editor {
                 text: Text::default(),
             },
         );
-        self.selection = Selection::at(
+        self.caret.set_selection(Selection::at(
             Cursor::new(at.block, Part::Body, at.offset.saturating_sub(len)).clamp(&self.doc),
-        );
+        ));
         self.history.interrupt();
         Some(Self::taken(at, 0..len))
     }
@@ -1386,7 +1350,7 @@ impl Editor {
     fn delete_back(&mut self, cx: &mut Context<Self>) {
         let at = self.cursor();
         // Reaching out of a block is structural; taking a character is not.
-        let kind = if self.selection.is_collapsed() && at.offset == 0 {
+        let kind = if self.caret.selection().is_collapsed() && at.offset == 0 {
             EditKind::Structure
         } else {
             EditKind::Delete
@@ -1394,8 +1358,8 @@ impl Editor {
         let painter = Painter::of(cx);
         self.edit(kind, cx, |this| {
             let before = this.doc.blocks.len();
-            let splice = if !this.selection.is_collapsed() {
-                this.doc.replace(this.selection, Text::default())
+            let splice = if !this.caret.selection().is_collapsed() {
+                this.doc.replace(this.caret.selection(), Text::default())
             } else if at.offset > 0 {
                 this.doc
                     .replace(Selection::new(at.left(&this.doc), at), Text::default())
@@ -1415,7 +1379,8 @@ impl Editor {
                 }
             };
             let head = splice.caret;
-            this.selection = Selection::at(head.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(head.clamp(&this.doc)));
             // Deleting narrows the query too, and backspacing onto the slash
             // itself is what closes the menu.
             this.track_slash("", painter);
@@ -1432,13 +1397,14 @@ impl Editor {
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
         self.edit(EditKind::Delete, cx, |this| {
             let at = this.cursor();
-            let range = if this.selection.is_collapsed() {
+            let range = if this.caret.selection().is_collapsed() {
                 Selection::new(at, at.right(&this.doc))
             } else {
-                this.selection
+                this.caret.selection()
             };
             let splice = this.doc.replace(range, Text::default());
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             vec![Delta::Spliced(splice)]
         });
     }
@@ -1485,14 +1451,17 @@ impl Editor {
         }
         self.edit(EditKind::Structure, cx, |this| {
             let mut deltas = Vec::new();
-            if !this.selection.is_collapsed() {
-                let splice = this.doc.replace(this.selection, Text::default());
-                this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            if !this.caret.selection().is_collapsed() {
+                let splice = this.doc.replace(this.caret.selection(), Text::default());
+                this.caret
+                    .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
                 deltas.push(Delta::Spliced(splice));
             }
             let at = this.cursor();
             let new = this.doc.split(at.block, at.offset);
-            this.selection = Selection::at(Cursor::new(new, Part::Body, 0).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(new, Part::Body, 0).clamp(&this.doc),
+            ));
             // What followed the caret moved into a block of its own, which
             // everything below it now sits under.
             deltas.push(Delta::Spliced(Splice {
@@ -1534,7 +1503,9 @@ impl Editor {
                 Block::at(BlockKind::Paragraph(Text::default()), indent),
             );
             this.doc.repair();
-            this.selection = Selection::at(Cursor::new(insert_at, Part::Body, 0).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(insert_at, Part::Body, 0).clamp(&this.doc),
+            ));
             vec![Delta::Opened {
                 at: insert_at,
                 count: 1,
@@ -1592,13 +1563,13 @@ impl Editor {
     /// things there are to back out of, innermost first.
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
         if self.pasted.take().is_none() && self.slash.take().is_none() {
-            self.selection = Selection::at(self.selection.head);
+            self.caret.set_selection(Selection::at(self.caret.head()));
         }
         cx.notify();
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.selection = Selection::all(&self.doc);
+        self.caret.set_selection(Selection::all(&self.doc));
         self.history.interrupt();
         self.caret_moved();
         cx.notify();
@@ -1607,16 +1578,16 @@ impl Editor {
     /// The selection as markdown — what a copy puts on the clipboard, and what
     /// a paste elsewhere reads back. Inside one fence, the code as it stands.
     fn selected_source(&self) -> Option<String> {
-        if self.selection.is_collapsed() {
+        if self.caret.selection().is_collapsed() {
             return None;
         }
         if self.in_fence() {
-            let (start, end) = self.selection.clamp(&self.doc).ordered();
+            let (start, end) = self.caret.selection().clamp(&self.doc).ordered();
             let code = self.doc.blocks[start.block].text_at(Part::Code)?;
             return Some(code.text[start.offset..end.offset].to_string());
         }
         Some({
-            let mut slice = self.doc.slice(self.selection);
+            let mut slice = self.doc.slice(self.caret.selection());
             slice.normalize_with(&self.marks);
             markdown::serialize_with(&slice, &self.marks)
         })
@@ -1634,8 +1605,9 @@ impl Editor {
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(source));
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::default());
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            let splice = this.doc.replace(this.caret.selection(), Text::default());
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             vec![Delta::Spliced(splice)]
         });
     }
@@ -1675,12 +1647,13 @@ impl Editor {
             return self.paste_url(url.to_string(), cx);
         }
         self.edit(EditKind::Structure, cx, |this| {
-            let removed = this.selection;
+            let removed = this.caret.selection();
             let before = this.doc.blocks.len();
             let head = this
                 .doc
                 .splice(removed, markdown::parse_with(&source, &this.marks));
-            this.selection = Selection::at(head.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(head.clamp(&this.doc)));
             vec![Delta::Spliced(Splice {
                 removed,
                 caret: head,
@@ -1691,15 +1664,16 @@ impl Editor {
 
     /// Whether the selection starts and ends in one fence's code.
     fn in_fence(&self) -> bool {
-        let (start, end) = self.selection.ordered();
+        let (start, end) = self.caret.selection().ordered();
         start.part == Part::Code && end.part == Part::Code && start.block == end.block
     }
 
     /// Put `text` in place of the selection as it stands, caret after it.
     fn paste_literal(&mut self, text: &str, cx: &mut Context<Self>) {
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::plain(text));
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            let splice = this.doc.replace(this.caret.selection(), Text::plain(text));
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             vec![Delta::Spliced(splice)]
         });
     }
@@ -1713,7 +1687,7 @@ impl Editor {
             return self.paste_literal(&url, cx);
         }
         // The one paste people expect to *not* overwrite what they chose.
-        if !self.selection.is_collapsed() {
+        if !self.caret.selection().is_collapsed() {
             return self.toggle_mark(Mark::Link(url), cx);
         }
         // A card needs a block with nothing else in it; a chip needs a body or
@@ -1721,8 +1695,9 @@ impl Editor {
         let at = self.cursor();
         let alone = at.part == Part::Body && self.caret_text().is_some_and(Text::is_empty);
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::link(&url));
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            let splice = this.doc.replace(this.caret.selection(), Text::link(&url));
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             vec![Delta::Spliced(splice)]
         });
         // A fence holds its URL literally and a caption cannot spell a mark, so
@@ -1763,7 +1738,8 @@ impl Editor {
                     }],
                 };
                 let splice = this.doc.replace(Selection::new(pasted.at, end), text);
-                this.selection = Selection::at(splice.caret.clamp(&this.doc));
+                this.caret
+                    .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
                 vec![Delta::Spliced(splice)]
             }),
             Choice::Bookmark => self.turn_into(ix, card(pasted.url, Form::Auto), cx),
@@ -1811,7 +1787,7 @@ impl Editor {
                     Cursor::new(ix + 1, Part::Body, 0)
                 }
             };
-            this.selection = Selection::at(at.clamp(&this.doc));
+            this.caret.set_selection(Selection::at(at.clamp(&this.doc)));
             vec![Delta::Spliced(Splice {
                 removed: Selection::new(
                     Cursor::new(ix, Part::Body, 0),
@@ -1824,18 +1800,18 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self
-            .history
-            .undo(self.mode, &self.doc, self.selection, &self.anchors)
+        if let Some(step) =
+            self.history
+                .undo(self.mode, &self.doc, self.caret.selection(), &self.anchors)
         {
             self.restore(step, cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self
-            .history
-            .redo(self.mode, &self.doc, self.selection, &self.anchors)
+        if let Some(step) =
+            self.history
+                .redo(self.mode, &self.doc, self.caret.selection(), &self.anchors)
         {
             self.restore(step, cx);
         }
@@ -1848,7 +1824,7 @@ impl Editor {
     /// two hundred keystrokes ago.
     fn restore(&mut self, step: crate::history::Step, cx: &mut Context<Self>) {
         self.doc = step.doc;
-        self.selection = step.selection.clamp(&self.doc);
+        self.caret.set_selection(step.selection.clamp(&self.doc));
         self.caret_moved();
         self.anchors = step.anchors;
         if step.mode != self.mode {
@@ -1877,7 +1853,8 @@ impl Editor {
             // The caret rides along, keeping its depth within the subtree
             // that moved and its offset within its own text.
             let block = to + caret.block.saturating_sub(ix);
-            this.selection = Selection::at(Cursor { block, ..caret }.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(Cursor { block, ..caret }.clamp(&this.doc)));
             vec![Delta::Moved { at, to: Some(to) }]
         });
     }
@@ -1891,7 +1868,9 @@ impl Editor {
             let Some(copy) = this.doc.duplicate(ix) else {
                 return vec![];
             };
-            this.selection = Selection::at(Cursor::new(copy, Part::Body, 0).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(copy, Part::Body, 0).clamp(&this.doc),
+            ));
             vec![Delta::Opened {
                 at: copy,
                 count: span.len(),
@@ -1906,8 +1885,9 @@ impl Editor {
         self.edit(EditKind::Structure, cx, |this| {
             let at = this.doc.subtree(ix);
             this.doc.remove_block(ix);
-            this.selection =
-                Selection::at(Cursor::new(ix.saturating_sub(1), Part::Body, 0).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(ix.saturating_sub(1), Part::Body, 0).clamp(&this.doc),
+            ));
             vec![Delta::Moved { at, to: None }]
         });
     }
@@ -1931,7 +1911,7 @@ impl Editor {
         }
         self.edit(EditKind::Structure, cx, |this| {
             this.doc.set_kind(ix, kind);
-            this.selection = this.selection.clamp(&this.doc);
+            this.caret.clamp(&this.doc);
             vec![]
         });
     }
@@ -1996,7 +1976,9 @@ impl Editor {
                 .blocks
                 .push(markdown::Block::new(BlockKind::Paragraph(Text::default())));
             let ix = this.doc.blocks.len() - 1;
-            this.selection = Selection::at(Cursor::new(ix, Part::Body, 0).clamp(&this.doc));
+            this.caret.set_selection(Selection::at(
+                Cursor::new(ix, Part::Body, 0).clamp(&this.doc),
+            ));
             vec![]
         });
         true
@@ -2049,10 +2031,7 @@ impl Editor {
             }
             return;
         }
-        if self.dragging
-            && let Some(hit) = self.layouts.hit(position)
-        {
-            self.selection = self.selection.extend_to(hit).clamp(&self.doc);
+        if self.dragging && self.caret.extend_at(position, &self.doc, &self.layouts) {
             cx.notify();
         }
     }
@@ -2079,18 +2058,15 @@ impl Editor {
         if self.tail_click(position, cx) {
             return;
         }
-        let Some(hit) = self.layouts.hit(position) else {
+        if !self.caret.select_at(
+            position,
+            click_count,
+            modifiers.shift,
+            &self.doc,
+            &self.layouts,
+        ) {
             return cx.notify();
-        };
-        self.selection = match click_count {
-            // Shift extends from wherever the anchor already is,
-            // which is what makes click-then-shift-click a range.
-            _ if modifiers.shift => self.selection.extend_to(hit),
-            1 => Selection::at(hit),
-            2 => Selection::new(hit.word_left(&self.doc), hit.word_right(&self.doc)),
-            _ => Selection::new(hit.home(), hit.end(&self.doc)),
         }
-        .clamp(&self.doc);
         self.dragging = click_count == 1 && !modifiers.shift;
         self.history.interrupt();
         self.caret_moved();
@@ -2132,7 +2108,8 @@ impl Editor {
         self.edit(EditKind::Delete, cx, |this| {
             let from = Cursor::new(at.block, at.part, at.offset - width);
             let splice = this.doc.replace(Selection::new(from, at), Text::default());
-            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            this.caret
+                .set_selection(Selection::at(splice.caret.clamp(&this.doc)));
             vec![Delta::Spliced(splice)]
         });
     }
@@ -2167,7 +2144,7 @@ impl Render for Editor {
             self.blink = None;
             self.caret_on = true;
         }
-        let selection = focused.then_some(self.selection);
+        let caret = focused.then_some(self.caret);
         // gpui ends an outside file drag — left the window or released
         // elsewhere — without a drop here, so the indicator goes with it.
         if !cx.has_active_drag() {
@@ -2333,8 +2310,9 @@ impl Render for Editor {
                                 break;
                             }
                         }
-                        this.selection =
-                            Selection::at(Cursor::new(at, Part::Body, 0).clamp(&this.doc));
+                        this.caret.set_selection(Selection::at(
+                            Cursor::new(at, Part::Body, 0).clamp(&this.doc),
+                        ));
                         deltas
                     });
                 }),
@@ -2418,56 +2396,38 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &RemoveBlock, _, cx| {
                 this.remove_block(this.cursor().block, cx)
             }))
-            // Motion is one method with a `Cursor` function and an "extend"
-            // flag, so a shift variant cannot drift from the key it shadows.
-            .on_action(cx.listener(|this, _: &Left, _, cx| this.moved(false, Cursor::left, cx)))
-            .on_action(cx.listener(|this, _: &Right, _, cx| this.moved(false, Cursor::right, cx)))
+            // Every visual motion is delegated intact to `Caret`; handlers do
+            // not split a document offset from its computed row identity.
+            .on_action(cx.listener(|this, _: &Left, _, cx| this.horizontal(false, false, cx)))
+            .on_action(cx.listener(|this, _: &Right, _, cx| this.horizontal(true, false, cx)))
             .on_action(cx.listener(|this, _: &Up, _, cx| this.vertical(false, false, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.vertical(true, false, cx)))
+            .on_action(cx.listener(|this, _: &Home, _, cx| this.row_edge(false, false, cx)))
+            .on_action(cx.listener(|this, _: &End, _, cx| this.row_edge(true, false, cx)))
             .on_action(
-                cx.listener(|this, _: &Home, _, cx| this.move_to_visual_row_edge(false, false, cx)),
+                cx.listener(|this, _: &DocumentStart, _, cx| this.document_edge(false, false, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &End, _, cx| this.move_to_visual_row_edge(false, true, cx)),
+                cx.listener(|this, _: &DocumentEnd, _, cx| this.document_edge(true, false, cx)),
             )
-            .on_action(cx.listener(|this, _: &DocumentStart, _, cx| {
-                this.moved(false, |_, doc| Selection::all(doc).anchor, cx)
-            }))
-            .on_action(cx.listener(|this, _: &DocumentEnd, _, cx| {
-                this.moved(false, |_, doc| Selection::all(doc).head, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &WordLeft, _, cx| this.moved(false, Cursor::word_left, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &WordRight, _, cx| this.moved(false, Cursor::word_right, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SelectLeft, _, cx| this.moved(true, Cursor::left, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SelectRight, _, cx| this.moved(true, Cursor::right, cx)),
-            )
+            .on_action(cx.listener(|this, _: &WordLeft, _, cx| this.word(false, false, cx)))
+            .on_action(cx.listener(|this, _: &WordRight, _, cx| this.word(true, false, cx)))
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.horizontal(false, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.horizontal(true, true, cx)))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.vertical(false, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.vertical(true, true, cx)))
-            .on_action(cx.listener(|this, _: &SelectHome, _, cx| {
-                this.move_to_visual_row_edge(true, false, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| {
-                this.move_to_visual_row_edge(true, true, cx)
-            }))
+            .on_action(cx.listener(|this, _: &SelectHome, _, cx| this.row_edge(false, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| this.row_edge(true, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDocumentStart, _, cx| {
-                this.moved(true, |_, doc| Selection::all(doc).anchor, cx)
+                this.document_edge(false, true, cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectDocumentEnd, _, cx| {
-                this.moved(true, |_, doc| Selection::all(doc).head, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectWordLeft, _, cx| {
-                this.moved(true, Cursor::word_left, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectWordRight, _, cx| {
-                this.moved(true, Cursor::word_right, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &SelectDocumentEnd, _, cx| {
+                    this.document_edge(true, true, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectWordLeft, _, cx| this.word(false, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectWordRight, _, cx| this.word(true, true, cx)))
             .w_full()
             // Text under the pointer, so the pointer says so — and only there,
             // or while a drag is still sweeping one out. The editor's box
@@ -2499,7 +2459,7 @@ impl Render for Editor {
                         Mode::Source => markdown::render_source(
                             self.source_text(),
                             markdown::Editing {
-                                selection,
+                                caret,
                                 caret_on: self.caret_on,
                                 layouts: Some(&self.layouts),
                                 typography: Some(markdown::Typography::of(cx).scaled(
@@ -2513,7 +2473,7 @@ impl Render for Editor {
                         Mode::Blocks => markdown::render_with(
                             &self.doc,
                             markdown::Editing {
-                                selection,
+                                caret,
                                 caret_on: self.caret_on,
                                 layouts: Some(&self.layouts),
                                 annotations: &self.annotations(),
@@ -2548,6 +2508,12 @@ impl Render for Editor {
                     let entity = cx.entity();
                     move |_, _, window, cx| {
                         entity.update(cx, |this, cx| {
+                            if this.caret.settle(&this.layouts) {
+                                // The frame just painted the row an edited
+                                // caret binds to; the next frame paints the
+                                // caret from that exact cached row.
+                                window.request_animation_frame();
+                            }
                             this.reveal_caret(cx);
                             this.settle_handle(window, cx);
                         });
