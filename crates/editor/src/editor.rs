@@ -718,6 +718,24 @@ impl Editor {
         cx.notify();
     }
 
+    /// The visual-row edge when it has painted, or the hard-line edge before
+    /// the first layout. Home and End remain useful during that first frame,
+    /// while every subsequent press respects soft wrapping.
+    fn visual_row_edge(&self, at: Cursor, end: bool) -> Cursor {
+        self.layouts.visual_row_edge(at, end).unwrap_or_else(|| {
+            if end {
+                line_end(at, &self.doc)
+            } else {
+                line_home(at, &self.doc)
+            }
+        })
+    }
+
+    fn move_to_visual_row_edge(&mut self, extend: bool, end: bool, cx: &mut Context<Self>) {
+        let target = self.visual_row_edge(self.selection.head, end);
+        self.moved(extend, |_, _| target, cx);
+    }
+
     /// Delete from the caret to wherever `to` lands — every kill chord, sharing
     /// the cursor functions the motion chords use so the two cannot disagree.
     ///
@@ -791,7 +809,11 @@ impl Editor {
         // Source mode maps nothing: its deltas are about one fence, and an
         // anchor dragged through those would point at the markup. They are
         // clamped back onto the document on the way out instead.
-        for delta in edit(self) {
+        let deltas = edit(self);
+        // A caret can move to a newly created visual row before the renderer
+        // records that row. Its prior coordinates are no longer its position.
+        self.layouts.invalidate();
+        for delta in deltas {
             if !self.blocks() {
                 continue;
             }
@@ -2402,8 +2424,12 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &Right, _, cx| this.moved(false, Cursor::right, cx)))
             .on_action(cx.listener(|this, _: &Up, _, cx| this.vertical(false, false, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.vertical(true, false, cx)))
-            .on_action(cx.listener(|this, _: &Home, _, cx| this.moved(false, line_home, cx)))
-            .on_action(cx.listener(|this, _: &End, _, cx| this.moved(false, line_end, cx)))
+            .on_action(
+                cx.listener(|this, _: &Home, _, cx| this.move_to_visual_row_edge(false, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &End, _, cx| this.move_to_visual_row_edge(false, true, cx)),
+            )
             .on_action(cx.listener(|this, _: &DocumentStart, _, cx| {
                 this.moved(false, |_, doc| Selection::all(doc).anchor, cx)
             }))
@@ -2424,8 +2450,12 @@ impl Render for Editor {
             )
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.vertical(false, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.vertical(true, true, cx)))
-            .on_action(cx.listener(|this, _: &SelectHome, _, cx| this.moved(true, line_home, cx)))
-            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| this.moved(true, line_end, cx)))
+            .on_action(cx.listener(|this, _: &SelectHome, _, cx| {
+                this.move_to_visual_row_edge(true, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| {
+                this.move_to_visual_row_edge(true, true, cx)
+            }))
             .on_action(cx.listener(|this, _: &SelectDocumentStart, _, cx| {
                 this.moved(true, |_, doc| Selection::all(doc).anchor, cx)
             }))
