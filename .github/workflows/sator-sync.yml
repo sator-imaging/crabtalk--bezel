@@ -1,4 +1,4 @@
-name: 'Sync Fork'
+name: '[Auto] Sync Fork'
 
 on:
   schedule:
@@ -9,6 +9,9 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  UPSTREAM: https://github.com/crabtalk/bezel.git
+
 jobs:
   reset-main:
     runs-on: ubuntu-latest
@@ -18,7 +21,7 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - run: git remote add upstream https://github.com/crabtalk/bezel.git
+      - run: git remote add upstream ${{ env.UPSTREAM }}
       - run: git fetch upstream
       - run: git restore --source=upstream/main .
       - run: git restore .github/workflows/sator*
@@ -31,6 +34,6 @@ jobs:
 
       - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
         with:
-          title:          "[bot] hard reset $(date '+%Y%m%d-%H%M%S')"
-          commit-message: "[bot] hard reset $(date '+%Y%m%d-%H%M%S')"
+          title:          "[bot] sync `${{ env.UPSTREAM }}`"
+          commit-message: "[bot] sync `${{ env.UPSTREAM }}`"
           delete-branch: true
