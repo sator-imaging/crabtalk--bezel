@@ -27,5 +27,5 @@ jobs:
           perl -0pi -e      's/^gpui_web\s*=.+$/gpui_web      = { git = "https:\/\/github.com\/crabtalk\/zed", version = ">=0.1.0" }/m' Cargo.toml
 
       - run: git add .
-      - run: git commit -m "reset: $(date '+%Y%m%d-%H%M%S')"
+      - run: git commit -m "[reset] $(date '+%Y%m%d-%H%M%S')"
       - run: git push -f
