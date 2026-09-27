@@ -192,9 +192,8 @@ impl Editor {
                     width: None,
                 },
             );
-            this.caret.set_selection(Selection::at(
-                Cursor::new(prompt.block, Part::Caption, 0).clamp(&this.doc),
-            ));
+            this.selection =
+                Selection::at(Cursor::new(prompt.block, Part::Caption, 0).clamp(&this.doc));
             vec![]
         });
     }
@@ -290,9 +289,7 @@ impl Editor {
                 );
             }
             this.doc.repair();
-            this.caret.set_selection(Selection::at(
-                Cursor::new(last, Part::Caption, 0).clamp(&this.doc),
-            ));
+            this.selection = Selection::at(Cursor::new(last, Part::Caption, 0).clamp(&this.doc));
             deltas.push(Delta::Opened {
                 at: first,
                 count: last + 1 - first,
