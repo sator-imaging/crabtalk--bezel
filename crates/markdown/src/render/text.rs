@@ -25,6 +25,8 @@ pub struct Mention {
     /// The favicon slot: one em space.
     pub icon: Range<usize>,
     pub favicon: Option<SharedString>,
+    /// The app's mark, painted in the slot instead of a favicon.
+    pub glyph: Option<ui::icons::Icon>,
     /// What stands in the slot while no favicon has loaded.
     pub initial: SharedString,
 }
@@ -232,6 +234,7 @@ pub fn flatten_with(
                 range: from..to,
                 icon: from..from + ICON_SLOT.len(),
                 favicon: described.icon,
+                glyph: described.glyph,
                 initial: host
                     .chars()
                     .next()
@@ -338,7 +341,19 @@ pub(super) fn painted_text(
                 .text_color(theme.text_faint)
                 .child(hint.clone())
         });
-    let styled = StyledText::new(flat.text).with_runs(flat.runs);
+    let (shape, height, hollow) = (
+        overlay.caret_shape,
+        overlay.caret_height,
+        overlay.caret_hollow(),
+    );
+    let glyph = caret
+        .filter(|_| shape.cuts_out(hollow))
+        .and_then(|offset| glyph_at(&flat.text, offset));
+    let runs = match &glyph {
+        Some(glyph) => ui::input::caret::recoloured(flat.runs, glyph, theme.bg),
+        None => flat.runs,
+    };
+    let styled = StyledText::new(flat.text).with_runs(runs);
     let layout = styled.layout().clone();
 
     let mentions = flat.mentions;
@@ -349,6 +364,7 @@ pub(super) fn painted_text(
             let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.into_iter().unzip();
             let hovered: Vec<(Range<usize>, String)> = mentions
                 .iter()
+                .filter(|mention| mention.glyph.is_none())
                 .map(|mention| (mention.range.clone(), mention.url.clone()))
                 .collect();
             let text = InteractiveText::new(ElementId::named_usize("md-text", ix), styled)
@@ -431,17 +447,22 @@ pub(super) fn painted_text(
                     ));
                 }
             }
-            if let Some(offset) = caret
-                && let Some(head) = layout.position_for_index(offset)
-            {
-                window.paint_quad(quad(
-                    caret_quad(head, size, layout.line_height()),
-                    px(0.0),
-                    caret_color,
-                    px(0.0),
-                    gpui::transparent_black(),
-                    BorderStyle::default(),
-                ));
+            if let Some(offset) = caret {
+                let face = font(Theme::of(cx).font_body.clone());
+                paint_caret(
+                    &layout,
+                    offset,
+                    glyph.as_ref(),
+                    CaretPaint {
+                        shape,
+                        height,
+                        hollow,
+                        color: caret_color,
+                        size,
+                        face,
+                    },
+                    window,
+                );
             }
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
@@ -465,6 +486,20 @@ pub(super) fn painted_text(
                     gpui::size(side, side),
                 );
                 let radius = gpui::Corners::all(side / 4.0);
+                if let Some(data) = mention.glyph.as_ref().and_then(|glyph| glyph.data()) {
+                    let path = SharedString::from(format!("markdown-glyph-{:p}", data.as_ptr()));
+                    window
+                        .paint_svg(
+                            icon,
+                            path,
+                            Some(data),
+                            gpui::TransformationMatrix::unit(),
+                            icon_color,
+                            cx,
+                        )
+                        .ok();
+                    continue;
+                }
                 if let Some(favicon) = favicon {
                     window
                         .paint_image(icon, icon, radius, favicon, 0, false)
@@ -526,6 +561,60 @@ pub(super) fn caret_quad(head: Point<Pixels>, size: f32, line_height: Pixels) ->
     )
 }
 
+/// The grapheme after `offset` on its line, if there is one.
+pub(super) fn glyph_at(text: &str, offset: usize) -> Option<Range<usize>> {
+    (offset < text.len() && text.is_char_boundary(offset) && !text[offset..].starts_with('\n'))
+        .then(|| offset..ui::input::next_boundary(text, offset))
+}
+
+/// How a caret is drawn, apart from where.
+pub(super) struct CaretPaint {
+    pub shape: ui::input::CaretShape,
+    pub height: ui::input::CaretHeight,
+    pub hollow: bool,
+    pub color: Hsla,
+    /// The text's font size, in pixels.
+    pub size: f32,
+    /// The font a wide caret measures its empty slot in.
+    pub face: gpui::Font,
+}
+
+/// Paints the caret at `offset` in `layout`. A `glyph` — the range recoloured
+/// for a solid block — is what the block covers, on whichever row it shaped.
+pub(super) fn paint_caret(
+    layout: &TextLayout,
+    offset: usize,
+    glyph: Option<&Range<usize>>,
+    paint: CaretPaint,
+    window: &mut Window,
+) {
+    let line_height = layout.line_height();
+    let covered = glyph.and_then(|glyph| range_rects(layout, glyph, 0.0, 0.0).into_iter().next());
+    let (head, width) = match covered {
+        Some(rect) => (rect.origin, rect.size.width),
+        None => {
+            let Some(head) = layout.position_for_index(offset) else {
+                return;
+            };
+            let width = match paint.shape {
+                ui::input::CaretShape::Bar => px(0.0),
+                _ => caret_advance(layout, offset).unwrap_or_else(|| {
+                    ui::input::caret::zero_width(paint.face, px(paint.size), window)
+                }),
+            };
+            (head, width)
+        }
+    };
+    window.paint_quad(paint.shape.quad(
+        caret_quad(head, paint.size, line_height),
+        line_height,
+        paint.height,
+        width,
+        paint.color,
+        paint.hollow,
+    ));
+}
+
 /// The rectangles a byte range occupies, one per visual row.
 pub(super) fn range_rects(
     layout: &gpui::TextLayout,
@@ -575,4 +664,18 @@ pub(super) fn range_rects(
         line_start += line.len() + 1;
     }
     rects
+}
+
+/// Resolve the advance in the same shaped line that owns the caret position.
+pub(super) fn caret_advance(layout: &TextLayout, offset: usize) -> Option<Pixels> {
+    let text = layout.text();
+    let mut start = 0;
+    for line in layout.line_layouts() {
+        let end = start + line.len();
+        if offset <= end {
+            return ui::input::caret::character_advance(&line, &text[start..end], offset - start);
+        }
+        start = end + 1;
+    }
+    None
 }

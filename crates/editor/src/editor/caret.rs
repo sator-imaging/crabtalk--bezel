@@ -144,7 +144,8 @@ impl Editor {
                 .doc
                 .replace(Selection::new(target, at), Text::default());
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
-            this.track_slash("");
+            this.track_slash("", Vec::new());
+            this.track_mention("");
             vec![Delta::Spliced(splice)]
         });
     }
@@ -181,13 +182,7 @@ impl Editor {
             .record(kind, self.mode, &self.doc, self.selection, &self.anchors);
         // A list rather than one: Enter clears a selection *and* splits, and an
         // anchor mapped through only half of that lands in the wrong place.
-        // Source mode maps nothing: its deltas are about one fence, and an
-        // anchor dragged through those would point at the markup. They are
-        // clamped back onto the document on the way out instead.
         for delta in edit(self) {
-            if !self.blocks() {
-                continue;
-            }
             for anchor in &mut self.anchors {
                 anchor.map(&delta);
             }
@@ -242,6 +237,10 @@ impl Editor {
         }
         if let Some(slash) = &mut self.slash {
             slash.step(delta);
+            return cx.notify();
+        }
+        if let Some(mention) = &mut self.mention {
+            mention.step(delta);
             return cx.notify();
         }
         let head = self.selection.head;

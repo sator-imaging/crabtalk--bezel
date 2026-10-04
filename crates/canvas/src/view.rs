@@ -118,7 +118,7 @@ fn command<A: 'static>(
 }
 
 impl CanvasView {
-    /// `layout` places the nodes; the kinds are what [`kind::set_kinds`]
+    /// `layout` places the nodes; the kinds are what [`crate::AppExt::set_canvas_kinds`]
     /// named, else the spec's.
     pub fn new(canvas: Canvas, layout: Layout, cx: &mut Context<Self>) -> Self {
         Self {
@@ -390,6 +390,7 @@ impl CanvasView {
                     slash: false,
                     language: false,
                     paste: false,
+                    mention: false,
                 })
                 .with_text_size(size)
         })
@@ -459,7 +460,7 @@ impl Render for CanvasView {
                         .w(px((a.x - b.x).abs()))
                         .h(px((a.y - b.y).abs()))
                         .border_1()
-                        .border_color(theme.accent)
+                        .border_color(theme.border_strong)
                         .bg(theme.accent.opacity(self.style.marquee_wash)),
                 )
             }

@@ -300,6 +300,39 @@ fn line_selection_takes_the_whole_row() {
     assert_eq!(e.selection_text().as_deref(), Some("second row\n"));
 }
 
+/// A drag from a double-click takes whole words, keeping the first one.
+#[test]
+fn a_word_selection_drags_by_words() {
+    let mut e = emu(30, 2);
+    e.feed(b"alpha beta gamma");
+    e.start_selection(
+        terminal::view::selection_type(2),
+        e.grid_point(0, 7),
+        Side::Left,
+    );
+    e.update_selection(e.grid_point(0, 12), Side::Left);
+    assert_eq!(e.selection_text().as_deref(), Some("beta gamma"));
+    e.update_selection(e.grid_point(0, 1), Side::Left);
+    assert_eq!(e.selection_text().as_deref(), Some("alpha beta"));
+}
+
+/// A drag from a triple-click takes whole rows.
+#[test]
+fn a_line_selection_drags_by_rows() {
+    let mut e = emu(30, 3);
+    e.feed(b"first row\r\nsecond row");
+    e.start_selection(
+        terminal::view::selection_type(3),
+        e.grid_point(1, 3),
+        Side::Left,
+    );
+    e.update_selection(e.grid_point(0, 2), Side::Left);
+    assert_eq!(
+        e.selection_text().as_deref(),
+        Some("first row\nsecond row\n")
+    );
+}
+
 /// A selection made across a line break keeps the newline, so pasting the
 /// copy reproduces the rows.
 #[test]
@@ -564,4 +597,30 @@ fn a_report_that_is_not_a_path_keeps_the_last_one() {
     e.feed(b"\x1b]7;file://host/tmp\x07");
     e.feed(b"\x1b]7;https://example.com/\x07\x1b]9;a notification\x07");
     assert_eq!(e.directory(), Some(std::path::Path::new("/tmp")));
+}
+
+#[test]
+fn a_cell_under_the_cursor_paints_its_glyph_in_its_background() {
+    let cell = CellSnapshot {
+        ch: 'x',
+        fg: CellColor::Indexed(1),
+        bg: CellColor::Rgb(1, 2, 3),
+        bold: false,
+        dim: true,
+        italic: false,
+        underline: false,
+        inverse: false,
+        hidden: false,
+        wide: false,
+        wide_spacer: false,
+        selected: false,
+    };
+    let under = cell.under_cursor();
+    assert_eq!(under.display_colors(), (cell.bg, cell.bg));
+    assert!(!under.dim);
+    let inverse = CellSnapshot {
+        inverse: true,
+        ..cell
+    };
+    assert_eq!(inverse.under_cursor().display_colors(), (cell.fg, cell.fg));
 }

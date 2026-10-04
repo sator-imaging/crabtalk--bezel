@@ -1,6 +1,7 @@
 //! Shaping and painting: runs, rows, selection and caret.
 
 use super::*;
+use crate::AppExt as _;
 
 /// What gets painted, and whether it is the placeholder — which is the only
 /// reason the colour differs.
@@ -220,7 +221,7 @@ impl Render for TextField {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The only place the blink starts: `caret_moved` drops the task, so the
         // next render brings it back in phase, solid beat first.
-        if self.focus_handle.is_focused(_window) && caret_blink(cx) {
+        if self.focus_handle.is_focused(_window) && cx.caret_blink() {
             if self.blink.is_none() {
                 self.start_blink(cx);
             }
@@ -429,7 +430,9 @@ impl Element for TextFieldElement {
             .cloned()
             .collect();
         let scrolled = field.scroll;
-        let follow_caret = field.follow_caret;
+        let caret_shape = cx.caret_shape();
+        let caret_height = cx.caret_height();
+        let follow_caret = field.follow_caret || caret_shape != field.last_caret_shape;
         let style = window.text_style();
 
         let (text, is_placeholder) = display_text(field);
@@ -467,7 +470,7 @@ impl Element for TextFieldElement {
         let wrap_width = shape.is_multiline().then_some(bounds.size.width);
         let lines = window
             .text_system()
-            .shape_text(text, font_size, &runs, wrap_width, None)
+            .shape_text(text.clone(), font_size, &runs, wrap_width, None)
             .map(|lines| lines.into_vec())
             .unwrap_or_default();
 
@@ -475,14 +478,70 @@ impl Element for TextFieldElement {
         // measured against shrinks under it — delete the last line while parked
         // at the bottom and an unclamped offset leaves the box showing nothing.
         //
-        // Only one axis is ever live. Wrapped lines are shaped to the box width,
-        // so `max.x` is zero for a multi-line field; a single line is one row
-        // tall, so `max.y` is zero for a single-line one. Neither needs asking
-        // which shape it is.
+        // A wide caret needs trailing room even at the end of the longest row.
+        // Keep the bar's existing scroll extent unchanged.
         let content_height: Pixels = lines.iter().map(|l| l.size(line_height).height).sum();
         let content_width = lines.iter().map(|l| l.width()).fold(px(0.), Pixels::max);
+        // The slot a wide caret takes where no character follows it — the end
+        // of the text, a soft-wrap boundary: the font's `ch` width.
+        let slot = (caret_shape != CaretShape::Bar)
+            .then(|| caret::zero_width(style.font(), font_size, window));
+        // A placeholder is not text: over it the caret takes the empty slot.
+        let follows = (!is_placeholder)
+            .then(|| {
+                lines_from(&lines)
+                    .find_map(|(start, line)| {
+                        (cursor <= start + line.len()).then(|| {
+                            caret::character_advance(line, &line.text, cursor.saturating_sub(start))
+                        })
+                    })
+                    .flatten()
+            })
+            .flatten();
+        let advance = slot.map(|slot| follows.unwrap_or(slot));
+        let hollow = !window.is_window_active();
+        let lines = if caret_shape.cuts_out(hollow)
+            && follows.is_some()
+            && selected_range.is_empty()
+            && field.caret_on
+            && field.focus_handle.is_focused(window)
+        {
+            let glyph = cursor..next_boundary(&text, cursor);
+            window
+                .text_system()
+                .shape_text(
+                    text.clone(),
+                    font_size,
+                    &caret::recoloured(runs, &glyph, theme.bg),
+                    wrap_width,
+                    None,
+                )
+                .map(|lines| lines.into_vec())
+                .unwrap_or(lines)
+        } else {
+            lines
+        };
+        let caret_width = caret_shape
+            .quad(
+                Bounds::new(
+                    gpui::point(px(0.), px(0.)),
+                    gpui::size(CARET_WIDTH, font_size),
+                ),
+                line_height,
+                caret_height,
+                advance.unwrap_or_default(),
+                theme.caret,
+                hollow,
+            )
+            .bounds
+            .size
+            .width;
+        // A field that wraps never scrolls sideways.
         let max = gpui::point(
-            (content_width - bounds.size.width).max(px(0.)),
+            match shape.is_multiline() {
+                true => px(0.),
+                false => (content_width + slot.unwrap_or_default() - bounds.size.width).max(px(0.)),
+            },
             (content_height - bounds.size.height).max(px(0.)),
         );
         let mut scroll = gpui::point(
@@ -499,8 +558,8 @@ impl Element for TextFieldElement {
             // that has to clear the right edge — not the character before it.
             if at.x < scroll.x {
                 scroll.x = at.x;
-            } else if at.x + CARET_WIDTH > scroll.x + bounds.size.width {
-                scroll.x = at.x + CARET_WIDTH - bounds.size.width;
+            } else if at.x + caret_width > scroll.x + bounds.size.width {
+                scroll.x = at.x + caret_width - bounds.size.width;
             }
             scroll.x = scroll.x.clamp(px(0.), max.x);
             scroll.y = scroll.y.clamp(px(0.), max.y);
@@ -508,6 +567,7 @@ impl Element for TextFieldElement {
         self.field.update(cx, |field, _| {
             field.scroll = scroll;
             field.follow_caret = false;
+            field.last_caret_shape = caret_shape;
         });
         let origin = bounds.origin - scroll;
 
@@ -530,14 +590,18 @@ impl Element for TextFieldElement {
             let at = position_for_offset(&lines, cursor, line_height).unwrap_or_default();
             (
                 Vec::new(),
-                Some(fill(
+                Some(caret_shape.quad(
                     // The font's size rather than the line's: leading is not
-                    // the caret's to fill.
+                    // a bar's or an underline's to fill. A block fills it.
                     Bounds::new(
                         origin + at + gpui::point(px(0.), (line_height - font_size) / 2.),
                         gpui::size(CARET_WIDTH, font_size),
                     ),
+                    line_height,
+                    caret_height,
+                    advance.unwrap_or_default(),
                     theme.caret,
+                    hollow,
                 )),
             )
         } else {
@@ -593,7 +657,7 @@ impl Element for TextFieldElement {
         // cleared with the frame that installed it.
         let dragged = self.field.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-            // The button being down is what makes this a drag. `is_selecting`
+            // The button being down is what makes this a drag. `selecting`
             // is only cleared on the release, so a press whose release went
             // somewhere we never heard about would otherwise leave a plain
             // hover dragging the run around.
@@ -617,20 +681,21 @@ impl Element for TextFieldElement {
                 window.paint_quad(quad);
             }
 
-            let mut top = origin;
-            for line in &lines {
-                line.paint(top, line_height, gpui::TextAlign::Left, None, window, cx)
-                    .ok();
-                top.y += line.size(line_height).height;
-            }
-
             // The caret only exists while focused — an unfocused field showing
-            // one reads as two cursors on screen.
+            // one reads as two cursors on screen. Under the text, so a glyph
+            // cut out of a block lands on top of it.
             if focus_handle.is_focused(window)
                 && caret_on
                 && let Some(cursor) = cursor
             {
                 window.paint_quad(cursor);
+            }
+
+            let mut top = origin;
+            for line in &lines {
+                line.paint(top, line_height, gpui::TextAlign::Left, None, window, cx)
+                    .ok();
+                top.y += line.size(line_height).height;
             }
         });
 
