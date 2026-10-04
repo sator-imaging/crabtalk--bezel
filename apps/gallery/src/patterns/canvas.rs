@@ -59,7 +59,7 @@ const SOURCE: &str = r##"{
 /// The sample's root, the one node the page will not let go.
 const ROOT: &str = "root";
 
-/// Installed with `canvas::set_kinds` under `"session"`.
+/// Installed with `canvas::AppExt::set_canvas_kinds` under `"session"`.
 pub fn session_kind() -> Kind {
     Kind::new(session).edit(Field::new(title, set_title))
 }
@@ -470,7 +470,7 @@ impl CanvasDemo {
             .gap(px(12.0))
             .pb(px(12.0))
             .border_b_1()
-            .border_color(theme.hairline(0.10))
+            .border_color(theme.border)
             .child(add)
             .child(history)
             .child(

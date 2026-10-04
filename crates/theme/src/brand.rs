@@ -165,7 +165,7 @@ impl Vibrancy {
 ///
 /// Installed as a gpui [`Global`]; [`Theme::install`] applies it to whatever
 /// palette is registered, so it survives a light/dark switch and composes with
-/// [`set_palette`](crate::set_palette) rather than competing with it.
+/// [`crate::AppExt::set_palette`](crate::AppExt::set_palette) rather than competing with it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Brand {
     /// The hue every grey in the palette carries.
@@ -179,6 +179,8 @@ pub struct Brand {
     /// How opaque the tint over the blurred window is. See
     /// [`Theme::VIBRANCY_ALPHA`], where it starts, and [`Theme::vibrancy_tint`].
     pub vibrancy_alpha: f32,
+    /// The blur behind the translucent window. See [`Theme::window_blur`].
+    pub window_blur: f32,
     /// Whether the window composites translucent, which is a question about
     /// the appearance as much as about the app — see [`Vibrancy`].
     pub vibrancy: Vibrancy,
@@ -202,6 +204,7 @@ impl Default for Brand {
             accent: Tint::NONE,
             radius: Theme::BASE_RADIUS,
             vibrancy_alpha: Theme::VIBRANCY_ALPHA,
+            window_blur: Theme::WINDOW_BLUR,
             vibrancy: Vibrancy::Auto,
             glass: crate::LENSED,
             ink: Ink::APPKIT,
@@ -244,6 +247,7 @@ impl Brand {
         // wants the coverage it tuned, not a value that was overwritten while
         // nothing was looking at it.
         theme.vibrancy_alpha = self.vibrancy_alpha;
+        theme.window_blur = self.window_blur;
         theme.glass = self.glass;
         self.ink.for_appearance(theme.appearance).paint(theme);
         // Every colour token, with the rule doing the choosing: a token that is
@@ -251,7 +255,7 @@ impl Brand {
         // danger, warning, success — is semantic and keeps it. Translucent ink
         // is skipped because it paints over whatever is beneath it, which is
         // tinted already.
-        let tokens: [&mut Hsla; 39] = [
+        let tokens: [&mut Hsla; 41] = [
             &mut theme.bg,
             &mut theme.surface,
             &mut theme.surface_raised,
@@ -260,6 +264,7 @@ impl Brand {
             &mut theme.surface_overlay,
             &mut theme.element_hover,
             &mut theme.element_active,
+            &mut theme.border_faint,
             &mut theme.border,
             &mut theme.border_strong,
             &mut theme.text,
@@ -285,6 +290,7 @@ impl Brand {
             &mut theme.cursor,
             &mut theme.caret,
             &mut theme.ring,
+            &mut theme.drop_target,
             &mut theme.danger_strong,
             &mut theme.code_text,
             &mut theme.code_wash,
@@ -353,7 +359,7 @@ fn label_on(plate: Hsla, theme: &Theme) -> Hsla {
 }
 
 /// Read the installed brand (the default before one is set).
-pub fn brand(cx: &App) -> Brand {
+pub(crate) fn brand(cx: &App) -> Brand {
     cx.try_global::<Brand>().copied().unwrap_or_default()
 }
 
@@ -362,7 +368,7 @@ pub fn brand(cx: &App) -> Brand {
 /// Colours are read imperatively at paint time, so nothing observes the theme
 /// global — the same reason [`appearance::apply`](crate::appearance::apply)
 /// refreshes rather than notifies.
-pub fn set_brand(brand: Brand, cx: &mut App) {
+pub(crate) fn set_brand(brand: Brand, cx: &mut App) {
     cx.set_global(brand);
     Theme::install(crate::paint::current_appearance(), cx);
     // Crossing 1.0 is what puts the `NSVisualEffectView` in or takes it out,

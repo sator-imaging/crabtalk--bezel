@@ -1,6 +1,7 @@
 //! Stateful overlays for either scroll axis.
 
-use super::{self as scroll, ScrollbarState, TransientState};
+use super::{self as scroll, ScrollbarState, Scroller, TransientState};
+use crate::AppExt as _;
 use gpui::{
     self, Animation, AnimationExt, AnyElement, App, Axis, Div, DragMoveEvent, Empty, Global,
     IntoElement, MouseButton, Pixels, RenderOnce, ScrollHandle, SharedString, Stateful, Window,
@@ -20,12 +21,12 @@ pub enum Visibility {
 }
 impl Global for Visibility {}
 
-pub fn visibility(cx: &App) -> Visibility {
+pub(crate) fn visibility(cx: &App) -> Visibility {
     cx.try_global::<Visibility>().copied().unwrap_or_default()
 }
 
 /// Set the default for overlays, including those inside Markdown blocks.
-pub fn set_visibility(value: Visibility, cx: &mut App) {
+pub(crate) fn set_visibility(value: Visibility, cx: &mut App) {
     cx.set_global(value);
     cx.refresh_windows();
 }
@@ -33,7 +34,7 @@ pub fn set_visibility(value: Visibility, cx: &mut App) {
 #[derive(IntoElement)]
 pub struct Overlay {
     id: SharedString,
-    handle: ScrollHandle,
+    handle: Scroller,
     axis: Axis,
     visibility: Option<Visibility>,
     place: scroll::Place,
@@ -41,10 +42,10 @@ pub struct Overlay {
 
 impl Overlay {
     /// Mount beside the scroller in a relative wrapper of the same size.
-    pub fn new(id: impl Into<SharedString>, handle: &ScrollHandle, axis: Axis) -> Self {
+    pub fn new(id: impl Into<SharedString>, handle: impl Into<Scroller>, axis: Axis) -> Self {
         Self {
             id: id.into(),
-            handle: handle.clone(),
+            handle: handle.into(),
             axis,
             visibility: None,
             place: scroll::Place::default(),
@@ -152,7 +153,7 @@ struct Horizontal {
 
 impl RenderOnce for Overlay {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let mode = self.visibility.unwrap_or_else(|| visibility(cx));
+        let mode = self.visibility.unwrap_or_else(|| cx.scrollbar_visibility());
         if mode == Visibility::Never {
             return Empty.into_any_element();
         }
@@ -212,7 +213,7 @@ struct HorizontalDrag(SharedString);
 
 fn horizontal(
     id: SharedString,
-    handle: &ScrollHandle,
+    handle: &Scroller,
     state: Rc<Cell<Horizontal>>,
     hover: Rc<Cell<scroll::Hover>>,
     always: bool,
