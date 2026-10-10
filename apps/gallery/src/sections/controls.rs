@@ -1,4 +1,5 @@
 use crate::*;
+use ui::AppExt as _;
 
 impl Gallery {
     pub(crate) fn controls(
@@ -236,6 +237,31 @@ impl Gallery {
                         ))),
                 )
                 .into_any_element(),
+
+            "color-picker" => {
+                let swatches = cx.color_swatches();
+                section
+                    .child(hint(
+                        &theme,
+                        "Pick a preset, or drag in the picker under it; a preset moves the picker.",
+                    ))
+                    .child(theme.swatch_picker(
+                        "swatches",
+                        &swatches,
+                        self.controls.swatch,
+                        None,
+                        cx.listener(move |view, ix: &usize, _, cx| {
+                            view.controls.swatch = Some(*ix);
+                            let color = cx.color_swatches()[*ix].resolve(Theme::of(cx));
+                            view.controls
+                                .picker
+                                .update(cx, |picker, cx| picker.set_color(color, cx));
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().w(px(220.0)).child(self.controls.picker.clone()))
+                    .into_any_element()
+            }
 
             "toggle-group" => section
                 .child(hint(
@@ -687,10 +713,19 @@ pub(crate) struct State {
     pub(crate) radio: usize,
     pub(crate) switched: [bool; 2],
     pub(crate) level: f32,
+    /// The preset picked, or `None` once the picker has moved off it.
+    pub(crate) swatch: Option<usize>,
+    pub(crate) picker: Entity<ui::color::ColorPicker>,
+    _picker: gpui::Subscription,
 }
 
 impl State {
     pub(crate) fn new(cx: &mut Context<Gallery>) -> Self {
+        let picker = cx.new(|cx| ui::color::ColorPicker::new(gpui::rgb(0x0A84FF).into(), true, cx));
+        let _picker = cx.subscribe(&picker, |view, _, _: &ui::color::ColorPickerEvent, cx| {
+            view.controls.swatch = None;
+            cx.notify();
+        });
         Self {
             search: cx.new(|cx| TextField::new(cx).with_placeholder("Search components…")),
             filled: cx.new(|cx| {
@@ -726,6 +761,9 @@ impl State {
             radio: 0,
             switched: [true, false],
             level: 0.5,
+            swatch: Some(7),
+            picker,
+            _picker,
         }
     }
 }

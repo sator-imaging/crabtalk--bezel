@@ -75,6 +75,16 @@ fn a_tooltip_is_an_action_rows_hover_text() {
 }
 
 #[test]
+fn an_indent_moves_action_and_submenu_rows() {
+    let nested = Item::action("Heading").indented(2);
+    assert!(matches!(&nested, Item::Action { indent: 2, .. }));
+    let submenu = Item::submenu("Section", vec![Item::action("a")]).indented(1);
+    assert!(matches!(&submenu, Item::Submenu { indent: 1, .. }));
+
+    assert_eq!(Item::Separator.indented(1), Item::Separator);
+}
+
+#[test]
 fn a_long_description_is_its_own_tooltip() {
     // The row clips the sentence, so the pairing is what the caller wants —
     // and one string means the two cannot drift apart.
@@ -120,6 +130,16 @@ fn a_separator_carries_nothing() {
     assert!(!Item::Separator.selectable());
     assert!(Item::action("a").selectable());
     assert!(!Item::action("a").disabled().selectable());
+}
+
+#[test]
+fn the_keyboard_steps_over_a_heading() {
+    let heading = Item::Heading("Turn into".into());
+    assert_eq!(heading.clone().with_icon(icons::glyph::Check), heading);
+    assert!(!heading.selectable());
+    let items = vec![heading, Item::action("a")];
+    assert_eq!(next_selectable(&items, None, 1), Some(1));
+    assert_eq!(next_selectable(&items, Some(1), 1), Some(1));
 }
 
 /// `a · Copy As › (Text · More › (Base64)) · ─ · b(disabled) · Empty ›() · c`

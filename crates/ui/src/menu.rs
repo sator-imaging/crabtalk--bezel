@@ -11,10 +11,15 @@
 //! can never disagree about which row an open submenu hangs off. What the
 //! pointer did comes back as a [`Hit`]; acting on it stays the caller's.
 
-use crate::{icons, keys, popover, scroll, tooltip::Tooltip};
+use crate::{
+    icons,
+    input::{FieldEvent, TextField},
+    keys, popover, scroll,
+    tooltip::Tooltip,
+};
 use gpui::{
-    Action, Axis, Context, MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Size, Window,
-    div, prelude::*, px,
+    Action, App, Axis, Context, Entity, Focusable as _, Global, KeyBinding, MouseDownEvent, Pixels,
+    Point, ScrollHandle, SharedString, Size, Subscription, Window, actions, div, prelude::*, px,
 };
 use icons::Icon;
 use std::{cell::Cell, rc::Rc};
@@ -34,6 +39,61 @@ const PANEL_MIN: f32 = 180.0;
 /// line, the panel needs a ceiling to clip it against rather than growing to
 /// whatever the longest one measures.
 const PANEL_DESCRIBED: f32 = 280.0;
+
+/// How many rows a searchable submenu shows before it scrolls.
+const SEARCH_ROWS: f32 = 10.0;
+
+actions!(bezel_menu, [SelectNext, SelectPrevious, Confirm, Dismiss]);
+
+/// How far each [`Item::indented`] level moves a row's content in, app-wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuIndent(pub Pixels);
+
+impl Default for MenuIndent {
+    fn default() -> Self {
+        Self(px(12.0))
+    }
+}
+
+impl Global for MenuIndent {}
+
+pub(crate) fn indent(cx: &App) -> MenuIndent {
+    cx.try_global::<MenuIndent>().copied().unwrap_or_default()
+}
+
+/// Changes the step and repaints open windows.
+pub(crate) fn set_indent(indent: MenuIndent, cx: &mut App) {
+    cx.set_global(indent);
+    cx.refresh_windows();
+}
+
+/// The key context around a searchable submenu's query field. Typing goes to
+/// the field; the arrows, enter and escape fall through to the menu.
+pub const SEARCH_CONTEXT: &str = "MenuSearch";
+
+/// The keymap a searchable submenu and a [`crate::context_menu`] answer to,
+/// as data — see [`crate::keys`].
+pub fn bindings() -> Vec<KeyBinding> {
+    let ctx = Some(SEARCH_CONTEXT);
+    let context = Some(crate::context_menu::KEY_CONTEXT);
+    vec![
+        KeyBinding::new("down", SelectNext, ctx),
+        KeyBinding::new("up", SelectPrevious, ctx),
+        KeyBinding::new("ctrl-n", SelectNext, ctx),
+        KeyBinding::new("ctrl-p", SelectPrevious, ctx),
+        KeyBinding::new("enter", Confirm, ctx),
+        KeyBinding::new("escape", Dismiss, ctx),
+        KeyBinding::new("down", SelectNext, context),
+        KeyBinding::new("up", SelectPrevious, context),
+        KeyBinding::new("enter", Confirm, context),
+        KeyBinding::new("escape", Dismiss, context),
+    ]
+}
+
+/// Install [`bindings`]. Call once at startup.
+pub fn init(cx: &mut App) {
+    cx.bind_keys(bindings());
+}
 
 /// A row in a menu.
 ///
@@ -59,6 +119,8 @@ pub enum Item {
         /// The leading glyph. A menu where no row has one keeps no room
         /// for it.
         icon: Option<Icon>,
+        /// Levels of [`Item::indented`]; 0 sits flush.
+        indent: usize,
         /// The accelerator to *print* — the binding itself is the app's, and
         /// bezel never dispatches it. A menu that showed a keystroke it did not
         /// own would be documenting a lie, which is what
@@ -74,8 +136,14 @@ pub enum Item {
     Submenu {
         label: SharedString,
         icon: Option<Icon>,
+        indent: usize,
         enabled: bool,
         items: Vec<Item>,
+        /// The placeholder of the query field the panel opens with, focused.
+        /// Typing narrows its rows by label and description; the panel shows
+        /// [`SEARCH_ROWS`] rows and scrolls past them. `None` opens a plain
+        /// panel.
+        search: Option<SharedString>,
     },
     /// Options side by side in one row, each a glyph over its label, the
     /// `selected` one highlighted. A pick is a [`Hit::Choose`] whose path is
@@ -85,6 +153,8 @@ pub enum Item {
         selected: usize,
         enabled: bool,
     },
+    /// A section's name over the rows after it. Never lit, never chosen.
+    Heading(SharedString),
     Separator,
 }
 
@@ -111,6 +181,7 @@ impl Item {
             description: None,
             tooltip: None,
             icon: None,
+            indent: 0,
             keystroke: None,
             checked: false,
             enabled: true,
@@ -121,9 +192,20 @@ impl Item {
         Item::Submenu {
             label: label.into(),
             icon: None,
+            indent: 0,
             enabled: true,
             items,
+            search: None,
         }
+    }
+
+    /// Open the submenu with a query field — see [`Item::Submenu::search`].
+    /// No-ops on anything but a submenu row.
+    pub fn searchable(mut self, placeholder: impl Into<SharedString>) -> Self {
+        if let Item::Submenu { search, .. } = &mut self {
+            *search = Some(placeholder.into());
+        }
+        self
     }
 
     pub fn segmented(segments: impl IntoIterator<Item = Segment>, selected: usize) -> Self {
@@ -134,14 +216,25 @@ impl Item {
         }
     }
 
-    /// No-ops on a separator, which has nothing to hang a glyph on, and on a
-    /// segmented row, whose glyphs are its segments'.
+    /// No-ops on a separator and a heading, which have nothing to hang a glyph
+    /// on, and on a segmented row, whose glyphs are its segments'.
     pub fn with_icon(mut self, icon: impl Into<Icon>) -> Self {
         match &mut self {
             Item::Action { icon: slot, .. } | Item::Submenu { icon: slot, .. } => {
                 *slot = Some(icon.into())
             }
-            Item::Segmented { .. } | Item::Separator => {}
+            Item::Segmented { .. } | Item::Heading(_) | Item::Separator => {}
+        }
+        self
+    }
+
+    /// Moves the row's content in by `level` steps of the app's
+    /// [`MenuIndent`], so a flat list of rows can show a hierarchy. No-ops on
+    /// a separator, a heading and a segmented row.
+    pub fn indented(mut self, level: usize) -> Self {
+        match &mut self {
+            Item::Action { indent, .. } | Item::Submenu { indent, .. } => *indent = level,
+            Item::Segmented { .. } | Item::Heading(_) | Item::Separator => {}
         }
         self
     }
@@ -230,7 +323,7 @@ impl Item {
             Item::Action { enabled, .. }
             | Item::Submenu { enabled, .. }
             | Item::Segmented { enabled, .. } => *enabled = false,
-            Item::Separator => {}
+            Item::Heading(_) | Item::Separator => {}
         }
         self
     }
@@ -245,7 +338,7 @@ impl Item {
             Item::Segmented {
                 enabled, segments, ..
             } => *enabled && !segments.is_empty(),
-            Item::Separator => false,
+            Item::Heading(_) | Item::Separator => false,
         }
     }
 
@@ -272,6 +365,28 @@ impl Item {
             Item::Segmented {
                 segments, selected, ..
             } if !segments.is_empty() => Some((*selected).min(segments.len() - 1)),
+            _ => None,
+        }
+    }
+
+    /// What a query is matched against: the label, then the description.
+    fn keywords(&self) -> String {
+        match self {
+            Item::Action {
+                label, description, ..
+            } => match description {
+                Some(description) => format!("{label} {description}"),
+                None => label.to_string(),
+            },
+            Item::Submenu { label, .. } => label.to_string(),
+            Item::Segmented { .. } | Item::Heading(_) | Item::Separator => String::new(),
+        }
+    }
+
+    /// The placeholder of the query field this row's submenu opens with.
+    fn search(&self) -> Option<&SharedString> {
+        match self {
+            Item::Submenu { search, .. } => search.as_ref(),
             _ => None,
         }
     }
@@ -525,10 +640,56 @@ pub enum Hit {
     Dismiss,
 }
 
+/// A row of a text surface's right-click menu, in the order [`edit_items`]
+/// lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edit {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+impl Edit {
+    /// The row a [`Hit::Choose`] path names in [`edit_items`].
+    pub fn at(path: &[usize]) -> Option<Self> {
+        match path {
+            [0] => Some(Edit::Cut),
+            [1] => Some(Edit::Copy),
+            [2] => Some(Edit::Paste),
+            [4] => Some(Edit::SelectAll),
+            _ => None,
+        }
+    }
+}
+
+/// The rows of a text surface's right-click menu. `actions` are the surface's
+/// own Cut, Copy, Paste and Select All, read for the chord each row prints.
+pub fn edit_items(
+    selected: bool,
+    pasteable: bool,
+    actions: [&dyn Action; 4],
+    window: &Window,
+) -> Vec<Item> {
+    let [cut, copy, paste, select_all] = actions;
+    let enable = |item: Item, on: bool| if on { item } else { item.disabled() };
+    vec![
+        enable(Item::action("Cut").with_shortcut(cut, window), selected),
+        enable(Item::action("Copy").with_shortcut(copy, window), selected),
+        enable(
+            Item::action("Paste").with_shortcut(paste, window),
+            pasteable,
+        ),
+        Item::Separator,
+        Item::action("Select All").with_shortcut(select_all, window),
+    ]
+}
+
 /// The panel a menu drops: every [`Item`] as a row, in a
 /// [`popover::popover_card`], with a further panel hanging off each submenu row
 /// the [`Cursor`] holds open. `id` prefixes the rows' element ids, so two menus
-/// open at once keep their hover state apart.
+/// open at once keep their hover state apart. In a test build each action and
+/// submenu row answers to the debug selector `{id}/{label}`.
 ///
 /// The root panel is returned unanchored: mount it through one of
 /// [`popover`]'s anchored layers ([`popover::anchored_menu_below`],
@@ -558,7 +719,16 @@ pub fn card<V: 'static>(
         chain: popover::Chain::default(),
         on: Rc::new(on),
     };
-    tree.panel(theme, items, cursor, &[], window, cx)
+    tree.panel(theme, items, cursor, &[], None, window, cx)
+}
+
+/// A searchable panel's query: its field, and whether it has been focused
+/// yet. Held in the panel's element state, so it lives while the panel is
+/// down and a panel opened again starts empty.
+struct Query {
+    field: Entity<TextField>,
+    focused: bool,
+    _changed: Subscription,
 }
 
 /// A gpui mouse listener, boxed: `Context::listener` borrows the context it is
@@ -583,12 +753,14 @@ struct Tree<V: 'static> {
 }
 
 impl<V: 'static> Tree<V> {
+    #[allow(clippy::too_many_arguments)]
     fn panel(
         &self,
         theme: &Theme,
         items: &[Item],
         cursor: &Cursor,
         prefix: &[usize],
+        search: Option<&SharedString>,
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> gpui::Div {
@@ -604,6 +776,22 @@ impl<V: 'static> Tree<V> {
             )
             .read(cx)
             .clone();
+        let query = search.map(|placeholder| self.query(&rows_id, placeholder, window, cx));
+        let text = query
+            .as_ref()
+            .map(|query| query.read(cx).field.read(cx).content().trim().to_owned())
+            .unwrap_or_default();
+        // The rows on show, by index into `items`, in the order they paint. A
+        // query ranks them and drops what it does not match.
+        let visible: Vec<usize> = if text.is_empty() {
+            (0..items.len()).collect()
+        } else {
+            let words: Vec<String> = items.iter().map(Item::keywords).collect();
+            popover::filter_indices(&text, &words)
+                .into_iter()
+                .filter(|&row| items[row].selectable())
+                .collect()
+        };
         // Only a change of live row or of the viewport's size scrolls: a wheel
         // that carried the live row out of view is left where it put it. gpui
         // drops a request made before the rows have been laid out, and measures
@@ -611,8 +799,8 @@ impl<V: 'static> Tree<V> {
         let size = handle.bounds().size;
         if size.height > Pixels::ZERO && shown.get() != Some((lit, size)) {
             shown.set(Some((lit, size)));
-            if let Some(lit) = lit {
-                handle.scroll_to_item(lit);
+            if let Some(at) = lit.and_then(|lit| visible.iter().position(|&row| row == lit)) {
+                handle.scroll_to_item(at);
             }
         }
         let inset = px(popover::SNAP) + window.client_inset().unwrap_or(Pixels::ZERO);
@@ -620,118 +808,132 @@ impl<V: 'static> Tree<V> {
         // A menu where nothing carries a glyph keeps no room for one — a bar's
         // menus would otherwise open with an empty column down their left.
         let gutter = items.iter().any(Item::has_icon);
+        let MenuIndent(step) = indent(cx);
         let described = items.iter().any(Item::has_description);
-        let rows =
-            div().id(rows_id.clone()).p(px(popover::MENU_PAD)).children(
-                items.iter().enumerate().map(|(row, item)| {
-                    if matches!(item, Item::Separator) {
-                        return popover::divider().into_any_element();
+        let rows = div()
+            .id(rows_id.clone())
+            .p(px(popover::MENU_PAD))
+            .children(visible.iter().map(|&row| {
+                let item = &items[row];
+                match item {
+                    Item::Separator => return popover::divider(theme).into_any_element(),
+                    Item::Heading(label) => {
+                        return popover::menu_heading(theme, label.clone()).into_any_element();
                     }
-                    let path: Vec<usize> = prefix.iter().copied().chain([row]).collect();
-                    if let Item::Segmented {
-                        segments,
-                        selected,
+                    _ => {}
+                }
+                let path: Vec<usize> = prefix.iter().copied().chain([row]).collect();
+                if let Item::Segmented {
+                    segments,
+                    selected,
+                    enabled,
+                } = item
+                {
+                    let live = cursor.segment().filter(|_| lit == Some(row));
+                    return self
+                        .segmented(theme, segments, *selected, *enabled, live, &path, cx)
+                        .into_any_element();
+                }
+                let id = row_id(&self.id, &path);
+                let (label, icon, indent, enabled) = match item {
+                    Item::Action {
+                        label,
+                        icon,
+                        indent,
                         enabled,
-                    } = item
-                    {
-                        let live = cursor.segment().filter(|_| lit == Some(row));
-                        return self
-                            .segmented(theme, segments, *selected, *enabled, live, &path, cx)
-                            .into_any_element();
+                        ..
                     }
-                    let id = row_id(&self.id, &path);
-                    let (label, icon, enabled) = match item {
-                        Item::Action {
-                            label,
-                            icon,
-                            enabled,
-                            ..
-                        }
-                        | Item::Submenu {
-                            label,
-                            icon,
-                            enabled,
-                            ..
-                        } => (label.clone(), icon.clone(), *enabled),
-                        Item::Segmented { .. } | Item::Separator => {
-                            unreachable!("returned above")
-                        }
-                    };
-                    let (description, hint) = match item {
-                        Item::Action {
-                            description,
-                            tooltip,
-                            ..
-                        } => (description.clone(), tooltip.clone()),
-                        _ => (None, None),
-                    };
-                    let row = if enabled {
-                        popover::menu_row(theme, lit == Some(row), None)
-                            .id(id.clone())
-                            .on_mouse_move(self.reports(Hit::Point(path.clone()), cx))
-                            .on_click(self.reports(
-                                match item {
-                                    // Clicking a submenu row opens it; there is
-                                    // nothing else it could mean.
-                                    Item::Submenu { .. } => Hit::Point(path.clone()),
-                                    _ => Hit::Choose(path.clone()),
-                                },
-                                cx,
-                            ))
-                    } else {
-                        disabled_row(theme).id(id.clone())
-                    };
-                    let row = row.when_some(hint, |row, hint| {
-                        row.tooltip(move |window, cx| Tooltip::text(hint.clone(), window, cx))
-                    });
-                    row.when(gutter, |row| row.child(glyph_slot(theme, icon, enabled)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(label)
-                                .children(description.map(|description| {
-                                    description_line(theme, description, enabled)
-                                })),
-                        )
-                        .map(|row| match item {
-                            Item::Action {
-                                keystroke, checked, ..
-                            } => row
-                                .when(*checked, |row| {
-                                    row.child(
-                                        icons::icon(icons::glyph::Check)
-                                            .size(px(GLYPH))
-                                            .text_color(theme.text),
-                                    )
-                                })
-                                .when_some(keystroke.clone(), |row, keystroke| {
-                                    row.child(popover::kbd_hint(theme, &keystroke))
-                                }),
-                            _ => row.child(
-                                icons::icon(icons::glyph::ChevronRight)
-                                    .size(px(GLYPH))
-                                    .text_color(theme.text_faint),
-                            ),
-                        })
-                        .when_some(
-                            item.opens().filter(|_| down == Some(path[depth])),
-                            |parent, inner| {
-                                let panel = self
-                                    .panel(theme, inner, cursor, &path, window, cx)
-                                    .into_any_element();
-                                parent.relative().child(popover::anchored_submenu(
-                                    SharedString::from(format!("{id}-panel")),
-                                    panel,
-                                    &self.chain,
-                                ))
+                    | Item::Submenu {
+                        label,
+                        icon,
+                        indent,
+                        enabled,
+                        ..
+                    } => (label.clone(), icon.clone(), *indent, *enabled),
+                    Item::Segmented { .. } | Item::Heading(_) | Item::Separator => {
+                        unreachable!("returned above")
+                    }
+                };
+                let (description, hint) = match item {
+                    Item::Action {
+                        description,
+                        tooltip,
+                        ..
+                    } => (description.clone(), tooltip.clone()),
+                    _ => (None, None),
+                };
+                let row = if enabled {
+                    popover::menu_row(theme, lit == Some(row), None)
+                        .id(id.clone())
+                        .on_mouse_move(self.reports(Hit::Point(path.clone()), cx))
+                        .on_click(self.reports(
+                            match item {
+                                // Clicking a submenu row opens it; there is
+                                // nothing else it could mean.
+                                Item::Submenu { .. } => Hit::Point(path.clone()),
+                                _ => Hit::Choose(path.clone()),
                             },
-                        )
-                        .into_any_element()
-                }),
-            );
+                            cx,
+                        ))
+                } else {
+                    disabled_row(theme).id(id.clone())
+                };
+                let selector = format!("{}/{label}", self.id);
+                let row = row.debug_selector(move || selector);
+                let row = row.when_some(hint, |row, hint| {
+                    row.tooltip(move |window, cx| Tooltip::text(hint.clone(), window, cx))
+                });
+                row.when(indent > 0, |row| {
+                    row.pl(px(popover::MENU_ROW_INSET) + step * indent as f32)
+                })
+                .when(gutter, |row| row.child(glyph_slot(theme, icon, enabled)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().truncate().child(label))
+                        .children(
+                            description
+                                .map(|description| description_line(theme, description, enabled)),
+                        ),
+                )
+                .map(|row| match item {
+                    Item::Action {
+                        keystroke, checked, ..
+                    } => row
+                        .when(*checked, |row| {
+                            row.child(
+                                icons::icon(icons::glyph::Check)
+                                    .size(px(GLYPH))
+                                    .text_color(theme.text),
+                            )
+                        })
+                        .when_some(keystroke.clone(), |row, keystroke| {
+                            row.child(popover::kbd_hint(theme, &keystroke))
+                        }),
+                    _ => row.child(
+                        icons::icon(icons::glyph::ChevronRight)
+                            .size(px(GLYPH))
+                            .text_color(theme.text_faint),
+                    ),
+                })
+                .when_some(
+                    item.opens().filter(|_| down == Some(path[depth])),
+                    |parent, inner| {
+                        let panel = self
+                            .panel(theme, inner, cursor, &path, item.search(), window, cx)
+                            .into_any_element();
+                        parent.relative().child(popover::anchored_submenu(
+                            SharedString::from(format!("{id}-panel")),
+                            panel,
+                            &self.chain,
+                        ))
+                    },
+                )
+                .into_any_element()
+            }));
         popover::popover_card(theme)
             .p_0()
             .flex()
@@ -742,11 +944,140 @@ impl<V: 'static> Tree<V> {
                 false => card.min_w(px(PANEL_MIN)),
             })
             .on_mouse_down_out(self.dismissal(cx))
-            .child(
-                scroll::Viewport::new(rows_id, rows, Axis::Vertical)
-                    .track_scroll(&handle)
-                    .fill(),
+            .map(|card| match query {
+                None => card.child(
+                    scroll::Viewport::new(rows_id, rows, Axis::Vertical)
+                        .track_scroll(&handle)
+                        .fill(),
+                ),
+                Some(query) => {
+                    let field = query.read(cx).field.clone();
+                    let rows = rows.max_h(px(
+                        SEARCH_ROWS * popover::menu_row_height() + 2.0 * popover::MENU_PAD
+                    ));
+                    card.child(
+                        div()
+                            .key_context(SEARCH_CONTEXT)
+                            .px(px(popover::MENU_PAD))
+                            .pt(px(popover::MENU_PAD))
+                            .map(|el| self.keys(el, items, &visible, lit, prefix, cx))
+                            .child(popover::search_line(theme, field.into_any_element())),
+                    )
+                    .child(match visible.is_empty() {
+                        true => div()
+                            .px(px(popover::MENU_PAD + popover::MENU_ROW_INSET))
+                            .pb(px(8.0))
+                            .text_style(TextStyle::Body)
+                            .text_color(theme.text_muted)
+                            .child("No matches")
+                            .into_any_element(),
+                        false => scroll::Viewport::new(rows_id, rows, Axis::Vertical)
+                            .track_scroll(&handle)
+                            .into_any_element(),
+                    })
+                }
+            })
+    }
+
+    /// The query of the searchable panel at `key`, focused the first time it
+    /// paints. Each edit repaints the view the menu is drawn in.
+    fn query(
+        &self,
+        key: &SharedString,
+        placeholder: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<V>,
+    ) -> Entity<Query> {
+        let host = cx.entity_id();
+        let placeholder = placeholder.clone();
+        let query = window.use_keyed_state(
+            SharedString::from(format!("{key}-query")),
+            cx,
+            move |_, cx| {
+                let field = cx.new(|cx| crate::search::query_field(placeholder, cx));
+                let _changed = cx.subscribe(&field, move |_, _, _: &FieldEvent, cx| {
+                    let app: &mut App = cx;
+                    app.notify(host);
+                });
+                Query {
+                    field,
+                    focused: false,
+                    _changed,
+                }
+            },
+        );
+        if !query.read(cx).focused {
+            query.update(cx, |query, _| query.focused = true);
+            let handle = query.read(cx).field.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        query
+    }
+
+    /// The arrows, enter and escape on a searchable panel's query: they walk
+    /// and choose among the rows on show, and report it as the pointer would.
+    fn keys(
+        &self,
+        el: gpui::Div,
+        items: &[Item],
+        shown: &[usize],
+        lit: Option<usize>,
+        prefix: &[usize],
+        cx: &mut Context<V>,
+    ) -> gpui::Div {
+        let landable: Rc<Vec<usize>> = Rc::new(
+            shown
+                .iter()
+                .copied()
+                .filter(|&row| items[row].selectable())
+                .collect(),
+        );
+        let at = lit.and_then(|lit| landable.iter().position(|&row| row == lit));
+        let path = {
+            let prefix = prefix.to_vec();
+            move |row: usize| prefix.iter().copied().chain([row]).collect::<Vec<_>>()
+        };
+        let step = |delta: isize| {
+            let count = landable.len() as isize;
+            (count > 0).then(|| {
+                let next = match at {
+                    Some(at) => (at as isize + delta).rem_euclid(count),
+                    None if delta > 0 => 0,
+                    None => count - 1,
+                };
+                landable[next as usize]
+            })
+        };
+        let next = step(1).map(&path);
+        let previous = step(-1).map(&path);
+        let chosen = at
+            .map(|at| landable[at])
+            .or_else(|| landable.first().copied())
+            .map(|row| match items[row].opens() {
+                Some(_) => Hit::Point(path(row)),
+                None => Hit::Choose(path(row)),
+            });
+        let on = self.on.clone();
+        let report = move |hit: Option<Hit>| {
+            let on = on.clone();
+            move |view: &mut V, window: &mut Window, cx: &mut Context<V>| {
+                if let Some(hit) = hit.clone() {
+                    on(view, hit, window, cx);
+                }
+            }
+        };
+        let (down, up, enter, escape) = (
+            report(next.map(Hit::Point)),
+            report(previous.map(Hit::Point)),
+            report(chosen),
+            report(Some(Hit::Dismiss)),
+        );
+        el.on_action(cx.listener(move |view, _: &SelectNext, window, cx| down(view, window, cx)))
+            .on_action(
+                cx.listener(move |view, _: &SelectPrevious, window, cx| up(view, window, cx)),
             )
+            .on_action(cx.listener(move |view, _: &Confirm, window, cx| enter(view, window, cx)))
+            .on_action(cx.listener(move |view, _: &Dismiss, window, cx| escape(view, window, cx)))
     }
 
     /// An [`Item::Segmented`] row: its segments share the row's width, the
@@ -874,7 +1205,7 @@ fn row_id(id: &SharedString, path: &[usize]) -> SharedString {
 
 /// The leading column: the row's glyph, or the room one would have taken, so a
 /// menu of mixed rows keeps its labels on one edge.
-fn glyph_slot(theme: &Theme, icon: Option<Icon>, enabled: bool) -> gpui::Div {
+pub fn glyph_slot(theme: &Theme, icon: Option<Icon>, enabled: bool) -> gpui::Div {
     div()
         .flex_none()
         .size(px(GLYPH))

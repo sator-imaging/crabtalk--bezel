@@ -11,7 +11,7 @@ fn plain_text_lands_on_row_zero() {
     let mut e = emu(20, 5);
     e.feed(b"hello");
     assert_eq!(e.row_text(0), "hello");
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 5 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((0, 5)));
 }
 
 #[test]
@@ -80,11 +80,11 @@ fn cursor_addressing_and_relative_moves() {
     e.feed(b"\x1b[3;5Hx");
     // CSI H is 1-based; cell written at row 2, col 4; cursor advanced by 1.
     assert_eq!(e.line(2)[4].ch, 'x');
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 2, col: 5 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((2, 5)));
     e.feed(b"\x1b[2D"); // left twice
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 2, col: 3 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((2, 3)));
     e.feed(b"\x1b[A"); // up
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 1, col: 3 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((1, 3)));
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn clear_screen_and_home() {
     for row in 0..4 {
         assert_eq!(e.row_text(row), "");
     }
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 0 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((0, 0)));
     e.feed(b"fresh");
     assert_eq!(e.row_text(0), "fresh");
 }
@@ -217,6 +217,57 @@ fn hidden_cursor_mode() {
 }
 
 #[test]
+fn decscusr_sets_the_cursor_shape_and_blink() {
+    let mut e = emu(10, 2);
+    let style = |e: &Emulator| e.cursor().map(|c| c.style);
+    assert_eq!(style(&e), Some(CursorStyle::default()));
+    e.feed(b"\x1b[5 q");
+    assert_eq!(
+        style(&e),
+        Some(CursorStyle {
+            shape: CursorShape::Beam,
+            blinking: true,
+        })
+    );
+    e.feed(b"\x1b[4 q");
+    assert_eq!(
+        style(&e),
+        Some(CursorStyle {
+            shape: CursorShape::Underline,
+            blinking: false,
+        })
+    );
+}
+
+#[test]
+fn a_cursor_override_outranks_decscusr_until_cleared() {
+    let mut e = emu(10, 2);
+    let host = CursorStyle {
+        shape: CursorShape::Underline,
+        blinking: true,
+    };
+    e.set_cursor_override(Some(host));
+    e.feed(b"\x1b[2 q");
+    assert_eq!(e.cursor().map(|c| c.style), Some(host));
+    e.set_cursor_override(None);
+    assert_eq!(e.cursor().map(|c| c.style), Some(CursorStyle::default()));
+}
+
+#[test]
+fn a_cursor_override_shows_during_a_render_hold() {
+    let mut e = emu(10, 2);
+    let host = CursorStyle {
+        shape: CursorShape::Beam,
+        blinking: false,
+    };
+    e.feed(b"\x1b[?2026h");
+    e.set_cursor_override(Some(host));
+    assert_eq!(e.cursor().map(|c| c.style), Some(host));
+    e.set_cursor_override(None);
+    assert_eq!(e.cursor().map(|c| c.style), Some(CursorStyle::default()));
+}
+
+#[test]
 fn resize_preserves_content_and_reflows_cursor() {
     let mut e = emu(20, 5);
     e.feed(b"keepme\r\nsecond");
@@ -237,7 +288,7 @@ fn wide_chars_occupy_two_cells_with_spacer() {
     assert!(line[1].wide_spacer);
     assert_eq!(line[2].ch, 'w');
     assert_eq!(e.row_text(0), "宽w");
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 3 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((0, 3)));
 }
 
 /// Viewport row → grid line, which is the translation every selection
@@ -300,6 +351,39 @@ fn line_selection_takes_the_whole_row() {
     assert_eq!(e.selection_text().as_deref(), Some("second row\n"));
 }
 
+/// A drag from a double-click takes whole words, keeping the first one.
+#[test]
+fn a_word_selection_drags_by_words() {
+    let mut e = emu(30, 2);
+    e.feed(b"alpha beta gamma");
+    e.start_selection(
+        terminal::view::selection_type(2),
+        e.grid_point(0, 7),
+        Side::Left,
+    );
+    e.update_selection(e.grid_point(0, 12), Side::Left);
+    assert_eq!(e.selection_text().as_deref(), Some("beta gamma"));
+    e.update_selection(e.grid_point(0, 1), Side::Left);
+    assert_eq!(e.selection_text().as_deref(), Some("alpha beta"));
+}
+
+/// A drag from a triple-click takes whole rows.
+#[test]
+fn a_line_selection_drags_by_rows() {
+    let mut e = emu(30, 3);
+    e.feed(b"first row\r\nsecond row");
+    e.start_selection(
+        terminal::view::selection_type(3),
+        e.grid_point(1, 3),
+        Side::Left,
+    );
+    e.update_selection(e.grid_point(0, 2), Side::Left);
+    assert_eq!(
+        e.selection_text().as_deref(),
+        Some("first row\nsecond row\n")
+    );
+}
+
 /// A selection made across a line break keeps the newline, so pasting the
 /// copy reproduces the rows.
 #[test]
@@ -358,12 +442,12 @@ fn a_synchronized_update_holds_the_frame_it_began_on() {
 
     e.feed(b"during");
     assert_eq!(e.row_text(1), "", "the held frame moved");
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 1, col: 0 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((1, 0)));
 
     e.feed(b"\x1b[?2026l");
     assert!(!e.render_hold());
     assert_eq!(e.row_text(1), "during");
-    assert_eq!(e.cursor(), Some(CursorSnapshot { row: 1, col: 6 }));
+    assert_eq!(e.cursor().map(|c| (c.row, c.col)), Some((1, 6)));
 }
 
 #[test]
@@ -564,4 +648,30 @@ fn a_report_that_is_not_a_path_keeps_the_last_one() {
     e.feed(b"\x1b]7;file://host/tmp\x07");
     e.feed(b"\x1b]7;https://example.com/\x07\x1b]9;a notification\x07");
     assert_eq!(e.directory(), Some(std::path::Path::new("/tmp")));
+}
+
+#[test]
+fn a_cell_under_the_cursor_paints_its_glyph_in_its_background() {
+    let cell = CellSnapshot {
+        ch: 'x',
+        fg: CellColor::Indexed(1),
+        bg: CellColor::Rgb(1, 2, 3),
+        bold: false,
+        dim: true,
+        italic: false,
+        underline: false,
+        inverse: false,
+        hidden: false,
+        wide: false,
+        wide_spacer: false,
+        selected: false,
+    };
+    let under = cell.under_cursor();
+    assert_eq!(under.display_colors(), (cell.bg, cell.bg));
+    assert!(!under.dim);
+    let inverse = CellSnapshot {
+        inverse: true,
+        ..cell
+    };
+    assert_eq!(inverse.under_cursor().display_colors(), (cell.fg, cell.fg));
 }

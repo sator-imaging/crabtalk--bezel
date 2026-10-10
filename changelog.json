@@ -1,5 +1,209 @@
 [
   {
+    "version": "0.2.11",
+    "date": "2026-10-09",
+    "summary": "Theme families from TOML, terminal colours and the frost tone as palette tokens, palette builders that capture, `#fragment` links that jump to their heading, a combobox row leading, cards set in the document's body face, and Home and End by painted row in wrapped text.",
+    "new": [
+      "`Theme::vibrancy_tone` is the frost's tint at full coverage, so a palette sets the colour of a translucent window and a brand tints it.",
+      "`Combobox::with_leading` draws an element before each row's label in the menu, such as a swatch or an icon.",
+      "`ThemeFamily` deserializes a theme family, TOML or any serde format: a name and a dark and a light `Variant`, each a set of colour tokens laid over the shipped palette for its appearance, where a nested table like `[dark.syntax]` names `syntax.*` tokens. `Theme::tokens_mut` names every token a file can set.",
+      "`Theme::terminal_bg` and `Theme::terminal_ansi` hold the terminal's background and its 16 named ANSI colours, so a palette sets them like any other token and a brand tints their greys.",
+      "A `#fragment` link in markdown jumps to the heading it names, matched as GitHub slugs headings, through `Editing::jump` and an `OnJump`. `markdown::link::slug` and `heading` resolve one.",
+      "`Editor::select_to_top` selects and scrolls the caret's row to the top of the scroll box; the editor jumps to a `#fragment` link's heading with it.",
+      "`BlockLayouts::row_start`, `row_end` and `wraps_at` give the painted row around a position."
+    ],
+    "changed": [
+      "`AppExt::set_palette` takes any `Fn(Appearance) -> Theme + 'static`, so a builder can capture what it builds from.",
+      "`TextInk::paint` sets the text roles' alphas over the colour the palette's `text` carries instead of over white or black, so a palette with its own text colour keeps it under a brand.",
+      "`terminal::view::indexed_color` resolves an indexed colour against a theme, and `extended_rgb` gives indexes 16-255. `terminal_bg_for`, `terminal_bg` and `indexed_rgb` are gone.",
+      "`Selection::affinity` names the row a caret at a soft wrap paints on. `BlockLayouts::position` takes an `Affinity`, `hit` answers with one, and `step_row` takes one and a column instead of a point. `Selection` built field by field needs the new field; `Selection::new` sets it."
+    ],
+    "fixed": [
+      "Cards, bands and captions inside a markdown document are set in `Theme::font_body` like its text, instead of the interface face, unless they name their own.",
+      "Home and End in a wrapped paragraph go to the edges of the painted row instead of the block, End's caret stays on its row, and Left and Right at a soft wrap first cross to the other row without moving."
+    ]
+  },
+  {
+    "version": "0.2.10",
+    "date": "2026-10-07",
+    "summary": "Public fence panel and band, translucent diagram nodes, a detached web inspector on macOS, and list items sized by their content.",
+    "new": [
+      "`markdown::render::fence_panel` and `fence_band` are public, so an app can draw its own fences in the box and band markdown uses."
+    ],
+    "changed": [
+      "Diagram nodes fill with a light wash of ink instead of the card surface, so they take on what the diagram sits on.",
+      "gpui is `bezel-gpui` 0.3.17."
+    ],
+    "fixed": [
+      "`WebView::open_inspector` opens the inspector in its own window on macOS instead of attaching it inside gpui's view.",
+      "List item text in a shrink-to-fit container is sized by its content instead of collapsing."
+    ]
+  },
+  {
+    "version": "0.2.9",
+    "date": "2026-10-05",
+    "summary": "Mermaid diagrams in markdown, an extended canvas format in the new bezel-canvas-core, resizable painted fences and embed cards, right-click menus, editor popups on ui::menu, nearest reveal, drag autoscroll, and hideable inactive carets.",
+    "new": [
+      "`bezel-canvas-core` holds the editor-free half of the canvas: the model, layouts, edits, paths and snapping, which `bezel-canvas` re-exports, and `diagram`, a read-only painter that draws a canvas at its own size. `diagram::size_of` gives that size.",
+      "The canvas format adds a `version`, a node's `Shape`, an edge's route `points` and `Stroke`, and `End::Circle` and `End::Cross`. `canvas_core::json_canvas::import` and `export` translate to and from JSON Canvas 1.0; `paint::color`, `shape`, `edge` and `end` paint its parts.",
+      "The `mermaid` feature of `bezel-canvas-core` adds `mermaid::import`, which lays out flowchart, state and class diagrams as a canvas.",
+      "The `mermaid` feature of `bezel-markdown` draws ` ```mermaid ` fences as diagrams in a fence box that pans by drag and zooms from corner controls. `markdown::mermaid::render` draws one.",
+      "Painted fences and embed cards drag taller from a grip along their foot in `bezel-editor`. The height is kept in markdown as `mermaid 360` in a fence's info string and `embed 360` in a link's title, and carried as `Fence::height` and `Form::Embed(Some(_))`. `FenceHost::resize`, `Editing::sizing` and `BlockLayouts::painted_bounds` back it.",
+      "`ui::context_menu::ContextMenu` opens a menu at the pointer that holds the keyboard until it closes. Text fields and editor text open Cut, Copy, Paste and Select All on a right press, from `ui::menu::edit_items` and `Edit`; pictures in the editor open their own menu.",
+      "`menu::Item::Heading` names a section over the rows after it.",
+      "The editor's block, table, language, link and paste menus are `ui::menu` menus walked by the keyboard. The block menu puts quotes and callouts behind one Quote submenu.",
+      "`BlockLayouts::reveal_with` takes a `RevealMode`: `Center`, as `reveal` does, or `Nearest`, the least scroll that shows the range.",
+      "A selection or a lifted block held past the editor's scroll box scrolls it.",
+      "`ui::AppExt::set_inactive_caret` makes a block caret in an inactive window outlined (`InactiveCaret::Hollow`, the default) or hidden (`InactiveCaret::Hidden`). `TerminalElement::with_hollow_inactive` does the same for a terminal's block cursor.",
+      "Focused tabs, live menu rows and selected tree rows paint the glass selection."
+    ],
+    "changed": [
+      "`editor::AppExt::set_block_menu_items` takes `Vec<SlashItem>` and `block_menu_defaults` returns one; `BlockMenuItem` is gone.",
+      "`menu::Item` has a `Heading` variant; exhaustive matches must handle it.",
+      "The link menu's `active` is a `cursor: menu::Cursor`, and its `choice` takes the chosen path and returns an `Option`.",
+      "`path::Ends` carries `from_end` and `to_end` as `End` instead of `from_arrow` and `to_arrow`.",
+      "`Canvas`, `Node` and `Edge` have new fields and `Fence` a `height` field; struct literals must include them.",
+      "`markdown::Form::Embed` carries an optional height.",
+      "An unfocused terminal draws no cursor, and a beam or underline cursor keeps its shape in an inactive window."
+    ],
+    "fixed": [
+      "Tab strips no longer draw an overlay scrollbar.",
+      "The markdown source view sets text at the body's size and leading."
+    ]
+  },
+  {
+    "version": "0.2.8",
+    "date": "2026-10-04",
+    "summary": "App-owned block menus and handle glyphs, mention triggers with icons, chips in text fields, menu row indents, terminal cursor shapes, and a browser console and inspector.",
+    "new": [
+      "`editor::AppExt::set_block_menu_items` replaces the block handle's menu, which is `editor::block_menu_defaults()` until it is called: the slash menu's blocks under \"Turn into\", then Duplicate and Delete. A `BlockMenuItem` is a `Heading` or a `Row(SlashRow)`.",
+      "`editor::AppExt::set_handles` replaces the glyphs the block handle and table row and column handles paint, which are `Handles::default()` grips until it is called. The block handle sits on the popover surface.",
+      "`Mention` rows carry an optional `icon`.",
+      "`TextField::set_chips` paints ranges of a field's content as a glyph and title, edited as one unit; `TextField::chips` reads them back. `ui::input::Shown` maps between content and shown offsets.",
+      "`Item::indented` moves a menu row in by levels of the app's `MenuIndent`, which `ui::AppExt::set_menu_indent` sets (12px by default).",
+      "The terminal honours DECSCUSR cursor shape and blink. `CursorSnapshot::style` carries a `CursorStyle` (`CursorShape::Block`, `Beam` or `Underline`, and `blinking`); `Emulator::set_cursor_override` pins a host style, and `TerminalElement::with_cursor_on` sets the blink phase.",
+      "`WebView::with_console` reports the page's console calls, uncaught errors and unhandled rejections as `WebViewEvent::Console(ConsoleMessage)`.",
+      "The `inspector` feature of `bezel-browser` adds `WebView::with_inspector` and `WebView::open_inspector`.",
+      "`ui::menu::glyph_slot` is public."
+    ],
+    "changed": [
+      "`editor::AppExt::set_mention_source` takes the trigger character first; each trigger keeps its own source.",
+      "`Mention` has an `icon` field and `CursorSnapshot` a `style` field; struct literals must include them.",
+      "`markdown::Shown` is a re-export of `ui::input::Shown`.",
+      "The block handle's menu is built from the installed block menu items instead of a fixed list."
+    ],
+    "fixed": [
+      "A growing text field measures its rows in its own font, so the browser gallery no longer panics resolving `.SystemUIFont`.",
+      "The browser gallery paints in Geist.",
+      "A drag ghost narrower than its item stays under the pointer.",
+      "Menu item labels truncate to one line instead of wrapping."
+    ]
+  },
+  {
+    "version": "0.2.7",
+    "date": "2026-10-03",
+    "summary": "App-owned slash menus with icons and groups, @ mentions, painted fences, app link cards and any-scheme links, searchable submenus, block caret height, and grey hairlines.",
+    "new": [
+      "`editor::AppExt::set_slash_items` replaces the slash menu's items, which are `editor::slash_defaults()` until it is called. A `SlashItem` is a `Row(SlashRow)` with a label, optional icon and `SlashAction`, or a `Group` of rows behind a submenu with its own icon. `SlashAction::Block` turns the block into a `BlockKind`; `SlashAction::Run` hands the app a `SlashAt` with the editor and block index.",
+      "The default slash rows carry block glyphs, with quotes and callouts behind one `Quote` group. A query ranks rows across groups; a group with several matches stays a submenu and a lone match stands as its own row.",
+      "`Chrome::mention` turns on an `@` menu over the rows from `editor::AppExt::set_mention_source`. Picking a `Mention` replaces `@query` with a chip linking its URL.",
+      "`markdown::BlockRenderer` receives a `Fence` with its language, code and an optional `rewrite` that writes new code as an undoable edit. Painted fences sit inside `PAINTED_CONTEXT`, so keys typed into their controls stay there; `LeaveBlock` returns focus to the document. `Editing::fence` takes a `FenceHost`, and `Editor::set_code`, `Editor::place_block` and `Doc::set_code` back it.",
+      "`markdown::AppExt::set_link_card` installs a `LinkCard` painter for links the app owns, in place of the bookmark. `LinkPreview::glyph` paints an app icon where a favicon would go; a chip with one opens no hover card.",
+      "Explicit links and autolinks accept any `scheme://` URL. `markdown::is_link` tests for one; `is_url` still decides what bare text links itself as.",
+      "`Item::searchable` opens a submenu with a focused query field that narrows its rows by label and description and scrolls past `SEARCH_ROWS`. `ui::menu::init` installs its keys; `ui::menu::bindings` returns them.",
+      "`ui::AppExt::set_caret_height` makes block carets fill the line (`CaretHeight::Line`, the default) or stand as tall as the text (`CaretHeight::Text`).",
+      "`Theme::border_faint` is the faintest hairline, and `Theme::drop_target` fills a pane docking preview when no material paints it."
+    ],
+    "changed": [
+      "`BlockRenderer` takes `&Fence` instead of separate language and code arguments.",
+      "`Theme` has `border_faint` and `drop_target` fields; struct literals must include them.",
+      "Hairline ink is a light grey on dark and a dark grey on light instead of pure white or black.",
+      "`popover::divider`, `popover::menu_section` and `popover::dialog_field` take `&Theme`.",
+      "Canvas selection rings and handles are 1px in the theme's `ring` color instead of the accent.",
+      "The pane docking preview is a thin material where materials are on, and `Theme::drop_target` otherwise.",
+      "`drag::Carry::host` takes the origin the target draws the ghost at.",
+      "gpui is updated to 0.3.16."
+    ],
+    "fixed": [
+      "Enter at the start of a block moves the whole block down under an empty paragraph, so a heading keeps its level.",
+      "Dropped drag items, including custom ghosts and tabs hosted by a dock, settle from where they were last drawn."
+    ]
+  },
+  {
+    "version": "0.2.6",
+    "date": "2026-10-02",
+    "summary": "Configurable window blur, drag-region scrolling over lists, solid block carets, a cross-platform color picker, word and line selection by double and triple click, and find and comment washes in source mode.",
+    "new": [
+      "`Brand::window_blur` and `Theme::window_blur` set the blur radius behind a translucent window, starting from `Theme::WINDOW_BLUR` (60). Zero leaves the window transparent and unblurred. macOS only; other platforms ignore it.",
+      "`ui::scroll::Scroller` wraps a div's `ScrollHandle` or a `gpui::list`'s `ListState`, so scrollbars, `follow`, and drag regions also work over lists.",
+      "While dragging, every region under the pointer scrolls near its visible edges, whether or not it accepts the dragged item.",
+      "`ui::color::ColorPicker` is a saturation/value field, hue strip, optional alpha strip and hex field drawn in gpui on every platform. It emits `ColorPickerEvent::Changed` on every drag step and every hex entry that parses; `set_color` moves it without emitting. `color::to_hex` and `color::parse_hex` convert between colors and hex strings.",
+      "`popover::MENU_ROW_INSET` is the inset of a menu row's text, for content that lines up with the rows.",
+      "Text fields select a word on double-click and a line on triple-click. In text fields and the editor, dragging after either extends the selection by word or line in both directions while keeping the clicked word or line selected.",
+      "`ui::input::Granularity` (`Char`, `Word`, `Line`) is what a press selects by, with `Granularity::of_clicks` and `Granularity::around`; `ui::input::drag_selection` gives the selection a drag holds from a pressed range. `markdown::Cursor::span` gives the word or line around a document position.",
+      "`terminal::view::selection_type` maps a press's click count to the terminal's `SelectionType`: simple, word or line.",
+      "`markdown::serialize_at_many` and `markdown::parse_at_many` map many positions between a document and its markdown in one pass. A position that cannot be placed comes back `None`."
+    ],
+    "changed": [
+      "`Brand` and `Theme` have a `window_blur` field; struct literals must include it.",
+      "`Region::track_scroll`, `scroll::follow`, and `scroll::Overlay::new` take `impl Into<Scroller>` instead of `&ScrollHandle`.",
+      "Terminal block cursors are opaque, with the glyph underneath drawn in the cell's background color.",
+      "gpui is updated to 0.3.15.",
+      "`color::open_panel` and the macOS system color panel are removed, along with the `objc2` dependencies; use `ColorPicker`.",
+      "`markdown::selectable::Pointer::Down` carries the press's `Granularity` as a second field.",
+      "Editor anchors are positions in the document currently shown: the source text in source mode, the blocks otherwise. They follow edits in source mode and are converted on each mode switch; an anchor with an end that cannot be placed after the switch comes back detached.",
+      "`ctrl-k` in the editor deletes to the end of the current line rather than the end of the block."
+    ],
+    "fixed": [
+      "Block carets in text fields, markdown text, and code blocks are solid and fill the line height, with the glyph underneath cut out in the background color. They are drawn hollow while the window is inactive.",
+      "Wrapping text fields no longer scroll sideways.",
+      "A pane's scroll offset never reads past its range, even before the next layout clamps it.",
+      "A triple-click in the editor's source mode selects one line instead of the whole document.",
+      "The caret is not drawn over a non-empty selection.",
+      "Find hits and comments paint in the editor's source mode, so a hit stepped to from a focused find field shows there."
+    ]
+  },
+  {
+    "version": "0.2.5",
+    "date": "2026-09-29",
+    "summary": "Configurable find washes and caret shapes, app-provided paste handling and picture overlays, split buttons, a color picker, traffic light captions, drag and drop with pane docking, and app configuration through extension traits.",
+    "new": [
+      "Table handles support drag reordering with a drop indicator. Menus offer Move up/down for body rows and Move left/right for columns. Moves preserve column alignment, selection, anchors, and undo history; the header row stays fixed.",
+      "Tables have six-dot row and column handles in dedicated left and top lanes. Right-clicking a cell opens insertion and deletion actions for both axes, even when the table header is scrolled out of view.",
+      "Editors expose picture hover controls through `with_image_overlay` and `set_image_overlay`, with `with_image_overlay_corner` and `set_image_overlay_corner` selecting their corner. Source mode has no picture controls.",
+      "`markdown::AppExt::set_find_paint` installs the match and current-match washes for editors and previews. Defaults remain the accent at 22% and 48% opacity.",
+      "`ui::AppExt::set_caret_shape` selects `CaretShape::Bar`, `Block`, or `Underline` for text fields, markdown text, and code blocks. The default bar is unchanged; terminal cursors remain controlled by the terminal program.",
+      "`editor::AppExt::set_paste_handler` lets the app return literal text, markdown, or `None` for existing paste behavior. The handler receives the clipboard, editor identity, mode, fence state, and base path; `cx.image_store()` exposes the installed media store. File drops remain separate.",
+      "`markdown::Editing::image_overlay` builds an app control from a picture's block index and URL. It appears on hover at `image_overlay_corner` (bottom-right by default) and stops presses from reaching the picture. Unset rendering is unchanged.",
+      "`Buttons::split_button` provides separately interactive main and menu halves, sized by `ControlSize`.",
+      "`ui::drag` reorders items within and across regions over gpui's active drag. A `Domain` builds `Region`s and `Handle`s; regions filter with `accepts` and `lands`, carry groups with `carries`, follow a `ScrollHandle` with `track_scroll`, and report `Drop` and `Outside` through `on_drop` and `on_drop_outside`. `Domain::with_ghost` draws a custom drag preview.",
+      "`ui::docking` previews pane docking for dragged tabs. `Dock::surface` and `Dock::pane` wrap the host's layout, a `Zone` names the join or split edge under the pointer, and `Surface::on_drop` hands the host one `Drop` to apply. Torn-off tabs show a preview and panes settle with an animation.",
+      "Reorderable tab bars animate tabs live as they are dragged and report drops outside the bar through `Bar::on_drop_outside`.",
+      "Tab bars draw their own horizontal overlay scrollbar. `TabBar::track_scroll` takes a `ScrollHandle` for programmatic scrolling.",
+      "`ui::color` adds preset `Swatch`es with light and dark values and `color::open_panel` for the macOS system color panel; it returns `false` on other platforms. `cx.set_color_swatches` replaces the preset set, which defaults to `color::default_swatches()`.",
+      "`color_well` draws a color ring, `swatch_picker` lays swatches in one row or in rows of a given column count, and `select_trigger_with` draws a leading element such as a swatch before the select label.",
+      "`cx.set_caption_style(CaptionStyle::Lights)` draws close, minimise, and zoom as left-aligned traffic lights in full-size caption targets. `titlebar::lights_width` returns the width they occupy for overlay layouts. The default `Rectangular` style is unchanged.",
+      "`Editor::relink` points every picture at one URL to another in one undo step, in both rich and source modes.",
+      "`SplitButton::build_alone` builds the label side without the chevron or menu."
+    ],
+    "changed": [
+      "App-owned configuration in `theme`, `ui`, `markdown`, `editor`, and `canvas` now uses crate-root `AppExt` traits implemented for `gpui::App`. Import the relevant trait and call methods on `cx`; previous public free-function settings APIs are removed. For example, use `cx.set_caret_shape(CaretShape::Block)` instead of `ui::input::set_caret_shape(CaretShape::Block, cx)`.",
+      "`markdown::Editing` has `image_overlay`, `image_overlay_corner`, and `table_controls` fields; struct literals without `..Default::default()` must include them. The editor reserves space inside table blocks for its add controls.",
+      "`tabs::Reorder` is built on `ui::drag`. `Reorder::bar` takes the strip and its tabs in model order and returns a `Bar` that reports `Move { from, to }` through `on_reorder`; `grab`, `follow`, and `tab` are removed.",
+      "`tabs::bar` returns a `TabBar` instead of a `Stateful<Div>`.",
+      "Client-decorated windows cast a single centered frame shadow that fits inside `Theme::CLIENT_INSET`.",
+      "gpui is updated to 0.3.14."
+    ],
+    "fixed": [
+      "Table row and column handles are anchored to the editor instead of the end of document flow, so they appear beside the intended cells rather than below the table.",
+      "Pictures explicitly use the arrow cursor instead of inheriting a text cursor from the surrounding page; captions remain text targets.",
+      "Table row and column handles stay reachable when the pointer crosses cell padding; their hitboxes no longer start 12px too far right and down. Add-row and add-column controls occupy reserved space inside the table block instead of extending into page margins.",
+      "A picture whose file changes keeps showing its last decoded image while it reloads or while the file is half-written, instead of painting as a loading image.",
+      "Pictures without a stated size display at their own size, held within the page, instead of scaling to the column.",
+      "Window edges flush against a tile or screen edge no longer resize, and maximized windows count as flush on every edge."
+    ]
+  },
+  {
     "version": "0.2.4",
     "date": "2026-09-28",
     "summary": "Tabs that reorder live under the pointer with a drop mark for other drops, a host-installed link handler in markdown, WebView data stores, cache-bypassing reload and back/forward availability, a wired segmented control, and a client-decorated frame whose shadow fits its window.",
