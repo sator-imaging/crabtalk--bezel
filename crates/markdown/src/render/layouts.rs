@@ -25,6 +25,9 @@ pub(super) struct Frames {
     /// full column and carries the caption, and a resize handle belongs on the
     /// edge of the picture itself.
     pictures: Vec<(usize, Bounds<Pixels>)>,
+    /// A painted block that can be resized: a painted fence, or a card
+    /// [`crate::Form::Embed`] spells.
+    painted: Vec<(usize, Bounds<Pixels>)>,
     /// A task block's checkbox, which is not its marker column: the column is
     /// gutter either side of the box, and a click there places a caret.
     checkboxes: Vec<(usize, Bounds<Pixels>)>,
@@ -36,12 +39,31 @@ pub(super) struct Frames {
     reveal: Option<Reveal>,
 }
 
+/// Where [`BlockLayouts::reveal_with`] puts a range that is not showing. A
+/// range already showing does not move either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RevealMode {
+    /// In the middle of the view.
+    #[default]
+    Center,
+    /// The least scroll that shows it, 16px in from the edge it came in
+    /// over. Taller than the view, its top shows.
+    Nearest,
+}
+
+/// The room [`RevealMode::Nearest`] leaves between a range and the view's
+/// edge, in pixels.
+pub(super) const REVEAL_MARGIN: f32 = 16.0;
+
 /// A range waiting to be scrolled into view.
 #[derive(Clone, Copy)]
 pub(super) struct Reveal {
     pub(super) range: Selection,
+    pub(super) mode: RevealMode,
     /// Frames it has scrolled in.
     pub(super) tries: u8,
+    /// Whether any of them moved the document.
+    pub(super) scrolled: bool,
     /// Where the column item holding it was placed last frame, in window
     /// coordinates. `None` before it has been built.
     pub(super) top: Option<Pixels>,
@@ -82,6 +104,8 @@ pub(super) struct PaintedRow {
     /// Where its line starts in the painted text's [`Shown`] offsets.
     line_start: usize,
     wrapped_row: usize,
+    /// Whether it ends at a soft wrap rather than at the end of its line.
+    wraps: bool,
 }
 
 impl BlockLayouts {
@@ -90,7 +114,7 @@ impl BlockLayouts {
     /// Falls back to the nearest text vertically, so clicking the margin
     /// beside a line — or below the last one — still lands somewhere useful
     /// rather than doing nothing.
-    pub fn hit(&self, point: Point<Pixels>) -> Option<Cursor> {
+    pub fn hit(&self, point: Point<Pixels>) -> Option<(Cursor, Affinity)> {
         let frames = self.0.borrow();
         if let Some(row) = frames.rows.iter().find(|row| row.bounds.contains(&point)) {
             return cursor_in_row(&frames, row, point.x);
@@ -107,12 +131,13 @@ impl BlockLayouts {
             .and_then(|row| cursor_in_row(&frames, row, point.x))
     }
 
-    /// Where a position painted last frame, and how tall its line is.
+    /// Where a position painted last frame, on the row `affinity` names at a
+    /// soft wrap, and how tall its line is.
     ///
     /// Vertical motion is geometry rather than arithmetic on line numbers, so
     /// a wrapped row and a hard newline are the same case and neither needs
     /// counting — the rule `ui::TextField` arrived at.
-    pub fn position(&self, at: Cursor) -> Option<(Point<Pixels>, Pixels)> {
+    pub fn position(&self, at: Cursor, affinity: Affinity) -> Option<(Point<Pixels>, Pixels)> {
         let frames = self.0.borrow();
         let painted = frames.texts.iter().find(|painted| {
             painted.block == at.block
@@ -120,10 +145,38 @@ impl BlockLayouts {
                 && painted.range.start <= at.offset
                 && at.offset <= painted.range.end
         })?;
-        let point = painted
-            .layout
-            .position_for_index(painted.shown.at(at.offset - painted.range.start))?;
+        let point = caret_position(
+            &painted.layout,
+            painted.shown.at(at.offset - painted.range.start),
+            affinity,
+        )?;
         Some((point, painted.layout.line_height()))
+    }
+
+    /// The start of the painted row holding `at`.
+    pub fn row_start(&self, at: Cursor, affinity: Affinity) -> Option<Cursor> {
+        let frames = self.0.borrow();
+        let row = row_of(&frames, at, affinity)?;
+        Some(Cursor::new(row.block, row.part, row.range.start))
+    }
+
+    /// The end of the painted row holding `at`, and the affinity that keeps a
+    /// caret there on that row.
+    pub fn row_end(&self, at: Cursor, affinity: Affinity) -> Option<(Cursor, Affinity)> {
+        let frames = self.0.borrow();
+        let row = row_of(&frames, at, affinity)?;
+        Some((
+            Cursor::new(row.block, row.part, row.range.end),
+            end_affinity(row),
+        ))
+    }
+
+    /// Whether `at` is a soft wrap last frame: the end of one painted row and
+    /// the start of the next.
+    pub fn wraps_at(&self, at: Cursor) -> bool {
+        self.0.borrow().rows.iter().any(|row| {
+            row.wraps && row.block == at.block && row.part == at.part && row.range.end == at.offset
+        })
     }
 
     /// The painted rows of a range, in document order — what a bar centred over
@@ -162,43 +215,28 @@ impl BlockLayouts {
             .collect()
     }
 
-    /// The position one painted row above or below `at`, and the row it landed
-    /// on. Walks the recorded runs in paint order — which is document order.
+    /// The position one painted row above or below `at` nearest `x`. Walks
+    /// the recorded runs in paint order — which is document order.
     ///
-    /// Two things make this refuse to be a hit test. The gap between blocks
-    /// belongs to no run, so a probe there answers with whichever run is
-    /// nearest — and at a boundary that is the block being *left*, whose bottom
-    /// edge is zero pixels away while the next block's top is a whole gap. And
-    /// `from` is passed in rather than derived from `at`, because an offset at
-    /// a soft wrap belongs to two rows and `position_for_index` always answers
-    /// with the first: derive it and every step down recomputes the same row.
+    /// Not a hit test: the gap between blocks belongs to no run, so a probe
+    /// there answers with whichever run is nearest — and at a boundary that is
+    /// the block being *left*, whose bottom edge is zero pixels away while the
+    /// next block's top is a whole gap.
     pub fn step_row(
         &self,
         at: Cursor,
-        from: Point<Pixels>,
+        affinity: Affinity,
+        x: Pixels,
         down: bool,
-    ) -> Option<(Cursor, Pixels)> {
+    ) -> Option<(Cursor, Affinity)> {
         let frames = self.0.borrow();
-        let ix = frames
-            .rows
-            .iter()
-            .position(|row| {
-                row.block == at.block
-                    && row.part == at.part
-                    && row_contains(row, at.offset)
-                    && row.bounds.origin.y <= from.y
-                    && from.y < row.bounds.origin.y + row.bounds.size.height
-            })
-            .or_else(|| {
-                frames.rows.iter().position(|row| {
-                    row.block == at.block && row.part == at.part && row_contains(row, at.offset)
-                })
-            })?;
+        let row = row_of(&frames, at, affinity)?;
+        let ix = frames.rows.iter().position(|r| std::ptr::eq(r, row))?;
         let next = match down {
             true => frames.rows.get(ix + 1)?,
             false => frames.rows.get(ix.checked_sub(1)?)?,
         };
-        Some((cursor_in_row(&frames, next, from.x)?, next.bounds.origin.y))
+        cursor_in_row(&frames, next, x)
     }
 
     /// Whether `point` is inside painted text.
@@ -271,6 +309,17 @@ impl BlockLayouts {
             .map(|(_, bounds)| *bounds)
     }
 
+    /// Where a resizable painted block painted last frame — a painted fence,
+    /// or an embed card — and `None` for any other block.
+    pub fn painted_bounds(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        self.0
+            .borrow()
+            .painted
+            .iter()
+            .find(|(at, _)| *at == ix)
+            .map(|(_, bounds)| *bounds)
+    }
+
     /// Where an image block's picture painted, which
     /// [`BlockLayouts::block_bounds`] does not give: that box spans the column
     /// and takes in the caption, so a handle placed from it sits off the edge
@@ -323,9 +372,16 @@ impl BlockLayouts {
     /// layouts and an [`Editing::scroll`]; without one the request is dropped
     /// at the next frame. A later call replaces an earlier one.
     pub fn reveal(&self, range: Selection) {
+        self.reveal_with(range, RevealMode::Center);
+    }
+
+    /// [`Self::reveal`], placing the start of `range` by `mode`.
+    pub fn reveal_with(&self, range: Selection, mode: RevealMode) {
         self.0.borrow_mut().reveal = Some(Reveal {
             range,
+            mode,
             tries: 0,
+            scrolled: false,
             top: None,
         });
     }
@@ -378,6 +434,10 @@ impl BlockLayouts {
         self.0.borrow_mut().pictures.push((ix, bounds));
     }
 
+    pub(super) fn record_painted(&self, ix: usize, bounds: Bounds<Pixels>) {
+        self.0.borrow_mut().painted.push((ix, bounds));
+    }
+
     pub(super) fn record_checkbox(&self, ix: usize, bounds: Bounds<Pixels>) {
         self.0.borrow_mut().checkboxes.push((ix, bounds));
     }
@@ -424,6 +484,7 @@ impl BlockLayouts {
         frames.blocks.clear();
         frames.languages.clear();
         frames.pictures.clear();
+        frames.painted.clear();
         frames.checkboxes.clear();
         frames.cells.clear();
     }
@@ -433,7 +494,34 @@ pub(super) fn row_contains(row: &PaintedRow, offset: usize) -> bool {
     row.range.start <= offset && offset <= row.range.end
 }
 
-pub(super) fn cursor_in_row(frames: &Frames, row: &PaintedRow, x: Pixels) -> Option<Cursor> {
+/// The row a caret at `at` paints on: at a soft wrap, the row before it when
+/// `affinity` is upstream and the row after it otherwise.
+fn row_of(frames: &Frames, at: Cursor, affinity: Affinity) -> Option<&PaintedRow> {
+    let mut rows = frames
+        .rows
+        .iter()
+        .filter(|row| row.block == at.block && row.part == at.part && row_contains(row, at.offset));
+    let first = rows.next()?;
+    let wrapped = first.wraps && first.range.end == at.offset;
+    match (wrapped, affinity) {
+        (true, Affinity::Downstream) => rows.next().or(Some(first)),
+        _ => Some(first),
+    }
+}
+
+/// The affinity of a caret at the end of `row`.
+fn end_affinity(row: &PaintedRow) -> Affinity {
+    match row.wraps {
+        true => Affinity::Upstream,
+        false => Affinity::Downstream,
+    }
+}
+
+pub(super) fn cursor_in_row(
+    frames: &Frames,
+    row: &PaintedRow,
+    x: Pixels,
+) -> Option<(Cursor, Affinity)> {
     let painted = &frames.texts[row.painted];
     let line = painted.layout.line_layout_for_index(row.line_start)?;
     let height = row.bounds.size.height;
@@ -442,8 +530,13 @@ pub(super) fn cursor_in_row(frames: &Frames, row: &PaintedRow, x: Pixels) -> Opt
         height * (row.wrapped_row as f32 + 0.5),
     );
     let (Ok(offset) | Err(offset)) = line.closest_index_for_position(local, height);
-    let offset = painted.range.start + painted.shown.offset(row.line_start + offset);
-    Some(Cursor::new(row.block, row.part, offset.min(row.range.end)))
+    let offset =
+        (painted.range.start + painted.shown.offset(row.line_start + offset)).min(row.range.end);
+    let affinity = match offset == row.range.end {
+        true => end_affinity(row),
+        false => Affinity::Downstream,
+    };
+    Some((Cursor::new(row.block, row.part, offset), affinity))
 }
 
 pub(super) fn record_rows(
@@ -466,6 +559,7 @@ pub(super) fn record_rows(
             .iter()
             .map(|wrap| shaped.runs[wrap.run_ix].glyphs[wrap.glyph_ix].index)
             .chain([line.len()]);
+        let rows_in_line = line.wrap_boundaries().len() + 1;
         let mut row_start = 0;
         for (row, row_end) in row_ends.enumerate() {
             rows.push(PaintedRow {
@@ -480,6 +574,7 @@ pub(super) fn record_rows(
                 ),
                 line_start,
                 wrapped_row: row,
+                wraps: row + 1 < rows_in_line,
             });
             row_start = row_end;
         }

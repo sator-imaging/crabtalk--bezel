@@ -5,6 +5,9 @@ use std::cell::Cell;
 use gpui::{Axis, Context, Entity, Point, ScrollHandle, SharedString, Window, div, prelude::*, px};
 use theme::{TextStyle, Theme, Typeset};
 
+/// What a row draws before its label, by index into the original items.
+pub(crate) type Leading = dyn Fn(usize, &Theme) -> gpui::AnyElement;
+
 use crate::{
     icons,
     input::{FieldEvent, TextField},
@@ -15,6 +18,17 @@ use crate::{
 /// height: the rows are what the reader is counting, and a figure in pixels
 /// would have to be restated every time their metrics move.
 const MAX_ROWS: f32 = 12.0;
+
+/// The field a [`popover::search_line`] holds: unframed, the line is its
+/// frame.
+pub(crate) fn query_field(
+    placeholder: impl Into<SharedString>,
+    cx: &mut Context<TextField>,
+) -> TextField {
+    TextField::new(cx)
+        .with_placeholder(placeholder)
+        .with_frame(false)
+}
 
 pub(crate) struct SearchList {
     pub query: Entity<TextField>,
@@ -35,11 +49,7 @@ impl SearchList {
         get: fn(&mut V) -> &mut Self,
         cx: &mut Context<V>,
     ) -> Self {
-        let query = cx.new(|cx| {
-            TextField::new(cx)
-                .with_placeholder(placeholder)
-                .with_frame(false)
-        });
+        let query = cx.new(|cx| query_field(placeholder, cx));
         cx.subscribe(&query, move |view, query, event: &FieldEvent, cx| {
             if matches!(event, FieldEvent::Changed(_)) {
                 let search = get(view);
@@ -80,6 +90,7 @@ impl SearchList {
         &self,
         theme: &Theme,
         selected: Option<usize>,
+        leading: Option<&Leading>,
         get: fn(&mut V) -> &mut Self,
         choose: fn(&mut V, usize, &mut Window, &mut Context<V>),
         cx: &mut Context<V>,
@@ -103,7 +114,15 @@ impl SearchList {
                     .on_click(
                         cx.listener(move |view, _, window, cx| choose(view, item, window, cx)),
                     )
-                    .child(self.filter.items()[item].clone())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .min_w_0()
+                            .children(leading.map(|leading| leading(item, theme)))
+                            .child(self.filter.items()[item].clone()),
+                    )
                     .when(selected == Some(item), |row| {
                         row.child(
                             icons::icon(icons::glyph::Check)

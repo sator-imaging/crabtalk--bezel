@@ -4,7 +4,9 @@ use gpui::{hsla, rgb};
 
 use crate::{
     Appearance, Ink, TextInk, color, paint,
-    theme::{Glass, MaterialSpec, SurfaceSpec, SurfaceStyle, Theme, syntax::SyntaxPalette},
+    theme::{
+        Glass, Material, MaterialSpec, SurfaceSpec, SurfaceStyle, Theme, syntax::SyntaxPalette,
+    },
 };
 
 impl Theme {
@@ -24,8 +26,9 @@ impl Theme {
             element_hover: hsla(0.0, 0.0, 1.0, 0.08),
             // `--color-active`, a rung above the hover: white at 12%.
             element_active: hsla(0.0, 0.0, 1.0, 0.12),
-            border: hsla(0.0, 0.0, 1.0, 0.08),
-            border_strong: hsla(0.0, 0.0, 1.0, 0.14),
+            border_faint: paint::hairline_for(Appearance::Dark, 0.06),
+            border: paint::hairline_for(Appearance::Dark, 0.08),
+            border_strong: paint::hairline_for(Appearance::Dark, 0.14),
             text: TextInk::color(Appearance::Dark, Ink::APPKIT.dark.text),
             text_muted: TextInk::color(Appearance::Dark, Ink::APPKIT.dark.muted),
             text_faint: TextInk::color(Appearance::Dark, Ink::APPKIT.dark.faint),
@@ -46,10 +49,11 @@ impl Theme {
             band: paint::band_for(Appearance::Dark),
             input_bg: hsla(0.0, 0.0, 1.0, 0.03),
             selection: rgb(0x3f638b).into(),
-            cursor: hsla(0.0, 0.0, 1.0, 0.35),
+            cursor: color::neutral(0.94), // near-white, opaque
             caret: color::neutral(0.673), // the accent
             ring: paint::hairline_for(Appearance::Dark, 0.35), // ~2.5× border_strong
-            drop_line: color::neutral(0.55),
+            drop_line: paint::hairline_for(Appearance::Dark, 0.35),
+            drop_target: hsla(0.0, 0.0, 1.0, 0.10),
             danger_strong: color::oklch(0.58, 0.16, 25.0),
             code_text: color::neutral(0.94), // near-white, a shade above body text
             code_wash: hsla(0.0, 0.0, 1.0, 0.08), // white/8
@@ -61,7 +65,14 @@ impl Theme {
             diff_add: color::oklch(0.765, 0.177, 163.223), // emerald-400
             diff_del: color::oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
+            // One small step up from `bg`: the terminal reads as its own pane
+            // without becoming a lighter box.
+            terminal_bg: color::grey(0x09),
+            terminal_ansi: ansi(ANSI_DARK),
             vibrancy_alpha: Self::VIBRANCY_ALPHA,
+            // Darker than `surface`: the reference vibrancy scrim, `hsl(0 0% 3%)`.
+            vibrancy_tone: color::grey(8),
+            window_blur: Self::WINDOW_BLUR,
             vibrancy: crate::frosted_window(),
             glass: crate::LENSED,
             // SwiftUI's frost, measured 2026-08-31: `tint / (1 - gain)` implies
@@ -132,6 +143,8 @@ impl Theme {
             // higher bar than the dome's algebra: fitting the formula to their
             // measured curve lands ~15% short of what the shader then renders.
             popover_surface: SurfaceStyle::Glass(Glass::Regular),
+            drop_preview: SurfaceStyle::Material(Material::Thin),
+            carried_surface: SurfaceStyle::Glass(Glass::Regular),
             glass_magnify: 1.1,
             glass_dispersion: 0.005,
             font_sans: SYSTEM_SANS.into(),
@@ -169,8 +182,9 @@ impl Theme {
             element_hover: hsla(0.0, 0.0, 0.0, 0.04),
             // The same rung in light: black at 6%.
             element_active: hsla(0.0, 0.0, 0.0, 0.06),
-            border: hsla(0.0, 0.0, 0.0, 0.10),
-            border_strong: hsla(0.0, 0.0, 0.0, 0.17),
+            border_faint: paint::hairline_for(Appearance::Light, 0.06),
+            border: paint::hairline_for(Appearance::Light, 0.08),
+            border_strong: paint::hairline_for(Appearance::Light, 0.14),
             text: TextInk::color(Appearance::Light, Ink::APPKIT.light.text),
             text_muted: TextInk::color(Appearance::Light, Ink::APPKIT.light.muted),
             text_faint: TextInk::color(Appearance::Light, Ink::APPKIT.light.faint),
@@ -195,10 +209,11 @@ impl Theme {
             band: paint::band_for(Appearance::Light),
             input_bg: color::grey(0xff),
             selection: rgb(0xb3d7ff).into(),
-            cursor: hsla(0.0, 0.0, 0.0, 0.55),
-            caret: color::neutral(0.511), // the accent
+            cursor: color::neutral(0.205), // near-black, opaque
+            caret: color::neutral(0.511),  // the accent
             ring: paint::hairline_for(Appearance::Light, 0.35),
-            drop_line: color::neutral(0.62),
+            drop_line: paint::hairline_for(Appearance::Light, 0.35),
+            drop_target: hsla(0.0, 0.0, 0.0, 0.06),
             danger_strong: color::oklch(0.51, 0.20, 25.0),
             code_text: color::neutral(0.18), // near-black, a shade under body text
             code_wash: hsla(0.0, 0.0, 0.0, 0.06), // black/6
@@ -210,7 +225,14 @@ impl Theme {
             diff_add: color::oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: color::oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            // One step down from the white `bg`. Larger than dark's 3/255: a
+            // near-white delta that separates on near-black vanishes on white.
+            terminal_bg: color::grey(0xfa),
+            terminal_ansi: ansi(ANSI_LIGHT),
             vibrancy_alpha: Self::VIBRANCY_ALPHA,
+            // The material's own measured tone.
+            vibrancy_tone: color::grey(235),
+            window_blur: Self::WINDOW_BLUR,
             vibrancy: crate::frosted_window(),
             glass: crate::LENSED,
             // Measured 2026-08-30, macOS 26.3 LIGHT, same instruments. The
@@ -272,6 +294,8 @@ impl Theme {
             // At 1-3pt inside the rim the real material drags the backdrop 26pt
             // or more, and lets go by 5.5pt; on the shader's profile that is 8.
             popover_surface: SurfaceStyle::Glass(Glass::Regular),
+            drop_preview: SurfaceStyle::Material(Material::Thin),
+            carried_surface: SurfaceStyle::Glass(Glass::Regular),
             glass_magnify: 1.1,
             glass_dispersion: 0.005,
             font_sans: SYSTEM_SANS.into(),
@@ -287,6 +311,53 @@ impl Theme {
             Appearance::Light => Self::light(),
         }
     }
+}
+
+/// The 16 ANSI colours on the dark terminal background.
+const ANSI_DARK: [u32; 16] = [
+    0x242424, // black — visible against #090909
+    0xf87171, // red
+    0x4ade80, // green
+    0xfacc15, // yellow
+    0x60a5fa, // blue
+    0xc084fc, // magenta
+    0x22d3ee, // cyan
+    0xd4d4d8, // white
+    0x52525b, // bright black
+    0xfca5a5, // bright red
+    0x86efac, // bright green
+    0xfde047, // bright yellow
+    0x93c5fd, // bright blue
+    0xd8b4fe, // bright magenta
+    0x67e8f9, // bright cyan
+    0xfafafa, // bright white
+];
+
+/// The same slots on the light background: the dark table's hue families at
+/// their 600/700 steps. "Bright" is darker here, not lighter, so it stays the
+/// more prominent half; bright black steps lighter than black in both tables.
+const ANSI_LIGHT: [u32; 16] = [
+    0x1f1f1f, // black
+    0xdc2626, // red — red-600
+    0x16a34a, // green — green-600
+    // Amber-700, not yellow-600: yellow-600 is 2.8:1 on white.
+    0xb45309, // yellow — amber-700
+    0x2563eb, // blue — blue-600
+    0x9333ea, // magenta — purple-600
+    0x0e7490, // cyan — cyan-700 (600 is too pale on white)
+    0x3f3f46, // white — the body-text tone, zinc-700
+    0x71717a, // bright black — zinc-500
+    0xb91c1c, // bright red — red-700
+    0x15803d, // bright green — green-700
+    0x92400e, // bright yellow — amber-800
+    0x1d4ed8, // bright blue — blue-700
+    0x7e22ce, // bright magenta — purple-700
+    0x155e75, // bright cyan — cyan-800
+    0x18181b, // bright white — max emphasis, zinc-900
+];
+
+fn ansi(table: [u32; 16]) -> [gpui::Hsla; 16] {
+    table.map(|c| rgb(c).into())
 }
 
 /// gpui's alias for whatever the platform calls its UI font, resolved per

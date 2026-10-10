@@ -4,17 +4,18 @@ use gpui::{Global, Hsla, SharedString};
 
 use crate::{Appearance, paint};
 
+mod family;
 mod glass;
-mod install;
+pub(crate) mod install;
 mod layout;
 mod palettes;
 mod syntax;
-mod typography;
+pub(crate) mod typography;
 
-pub use install::set_palette;
+pub use family::{ThemeFamily, Variant};
 pub use layout::{ControlSize, Sizing};
 pub use syntax::{HighlightKind, SyntaxPalette};
-pub use typography::{Metrics, TextStyle, Typeset, base_text_size, set_base_text_size};
+pub use typography::{Metrics, TextStyle, Typeset, base_text_size};
 
 /// The two shipped glasses — SwiftUI's `Glass.regular` and `Glass.clear`. A
 /// closed variant rather than knobs: Apple exposes no numbers on glass either,
@@ -213,6 +214,8 @@ pub struct Theme {
     pub element_hover: Hsla,
     /// Active/selected wash, one rung over the hover — `--color-active`.
     pub element_active: Hsla,
+    /// Faintest hairline: dividers inside a card, nested frames.
+    pub border_faint: Hsla,
     /// Hairline border.
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
@@ -255,7 +258,7 @@ pub struct Theme {
     /// theme.accent = my_brand_accent(appearance);
     /// ```
     ///
-    /// See [`set_palette`](crate::theme::install::set_palette), which is what
+    /// See [`crate::AppExt::set_palette`](crate::AppExt::set_palette), which is what
     /// makes an override survive an appearance switch.
     pub accent: Hsla,
     /// Stronger accent for fills that carry [`Self::on_accent`] text. Neutral by
@@ -302,7 +305,8 @@ pub struct Theme {
     /// accent: `NSColor.selectedTextBackgroundColor` is `#B3D7FF` light and
     /// `#3F638B` dark.
     pub selection: Hsla,
-    /// Terminal block cursor.
+    /// Terminal block cursor. Opaque: the glyph under it is drawn in the
+    /// cell's background colour.
     pub cursor: Hsla,
     /// Text caret — [`Self::accent`]'s lightness.
     ///
@@ -317,6 +321,9 @@ pub struct Theme {
     pub ring: Hsla,
     /// Where a dragged block would land in the block editor.
     pub drop_line: Hsla,
+    /// Fill of the region a dragged pane would dock into, where no material
+    /// paints it. Translucent: the pane under it stays visible.
+    pub drop_target: Hsla,
     /// Destructive-action button fill (danger plate, carries [`Self::on_accent`]).
     pub danger_strong: Hsla,
 
@@ -335,6 +342,13 @@ pub struct Theme {
     /// Diff: hunk-header wash (bluish grey).
     pub diff_hunk_bg: Hsla,
 
+    // ---- paint: terminal ----
+    /// The terminal grid's background, behind cells that paint none.
+    pub terminal_bg: Hsla,
+    /// The 16 named ANSI colours: 0-7 normal, 8-15 bright. Indexes 16-255 —
+    /// the xterm cube and grey ramp — are not part of a palette.
+    pub terminal_ansi: [Hsla; 16],
+
     // ---- glass ----
     //
     // Numbers, so they flow with the appearance the way every other token
@@ -342,6 +356,13 @@ pub struct Theme {
     // nothing here is a parameter on a component.
     /// How opaque the tint over the blurred window is.
     pub vibrancy_alpha: f32,
+    /// The tint over the blurred window, at full coverage — see
+    /// [`Self::vibrancy_tint`].
+    pub vibrancy_tone: Hsla,
+    /// The blur behind a translucent window, in native filter pixels with no
+    /// scale conversion. Zero leaves the window transparent and unblurred.
+    /// macOS alone; other platforms ignore it.
+    pub window_blur: f32,
     /// Whether the window composites translucent, so the desktop reaches what
     /// is painted over it — AppKit's vibrancy.
     pub vibrancy: bool,
@@ -358,6 +379,13 @@ pub struct Theme {
     /// on. They take no theme of their own, so this is where the choice
     /// lives; a component that owns its surface names its own style instead.
     pub popover_surface: SurfaceStyle,
+    /// What a docking drop preview paints on where [`LENSED`](crate::LENSED)
+    /// and [`Theme::glass`] hold; elsewhere it is a [`Theme::drop_target`]
+    /// wash.
+    pub drop_preview: SurfaceStyle,
+    /// What a dragged item's floating copy paints on — see
+    /// `ui::drag::Carried::ghost`.
+    pub carried_surface: SurfaceStyle,
     /// Lens displacement amplitude, signed; negative inverts it.
     pub glass_magnify: f32,
     /// Per-channel spread of that displacement — the chromatic fringe.

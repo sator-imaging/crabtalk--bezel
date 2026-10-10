@@ -13,7 +13,7 @@
 //!   cols×rows back to the host through its grid callback, and paints the
 //!   grid: background quads for non-default cells, one `ShapedLine` per row
 //!   (same font whatever the colors — paint never changes layout), and the
-//!   cursor block.
+//!   cursor in its shape.
 
 use gpui::{
     App, Bounds, Edges, GlobalElementId, Hsla, KeyLayout, LayoutId, Modifiers, PaintQuad, Pixels,
@@ -30,7 +30,7 @@ use std::{
 };
 
 use crate::emulator::{
-    CellColor, CellSnapshot, CursorSnapshot, Emulator, Frame, KeyboardMode, MouseMode,
+    CellColor, CellSnapshot, CursorShape, CursorSnapshot, Emulator, Frame, KeyboardMode, MouseMode,
     MouseTracking, Side, Source,
 };
 
@@ -47,6 +47,9 @@ pub use palette::*;
 /// Terminal font metrics (mono).
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
+
+/// How thick a beam or underline cursor paints.
+const CURSOR_THICKNESS: Pixels = px(2.0);
 
 /// Keyboard input coalescing window before a PTY write flush.
 pub const COALESCE_MS: u64 = 12;
@@ -219,6 +222,8 @@ type GridHook = Box<dyn Fn(GridGeometry, &mut App) -> Option<GridSnapshot>>;
 pub struct TerminalElement {
     grid: GridHook,
     focused: bool,
+    cursor_on: bool,
+    hollow_inactive: bool,
     font_size: f32,
     inset: Edges<Pixels>,
 }
@@ -231,6 +236,8 @@ impl TerminalElement {
         Self {
             grid: Box::new(grid),
             focused,
+            cursor_on: true,
+            hollow_inactive: true,
             font_size: TERM_FONT_SIZE,
             inset: Edges::default(),
         }
@@ -242,6 +249,21 @@ impl TerminalElement {
         if points.is_finite() && points > 0. {
             self.font_size = points;
         }
+        self
+    }
+
+    /// Which half of its blink a blinking cursor is in. The element has no
+    /// timer: the host flips this to blink. Defaults to on; a steady cursor and
+    /// an unfocused one ignore it.
+    pub fn with_cursor_on(mut self, on: bool) -> Self {
+        self.cursor_on = on;
+        self
+    }
+
+    /// Whether a block cursor shows outlined while its window is inactive,
+    /// rather than not at all. Defaults to on.
+    pub fn with_hollow_inactive(mut self, hollow: bool) -> Self {
+        self.hollow_inactive = hollow;
         self
     }
 
@@ -471,6 +493,15 @@ impl gpui::Element for TerminalElement {
             .collect();
         images.sort_by_key(|painted| painted.order);
 
+        // Only a focused grid has a cursor. In an inactive window a block is
+        // outlined, or not there; a beam or an underline is unchanged.
+        let active = window.is_window_active();
+        let solid = self.focused && active;
+        let cursor = snapshot
+            .cursor
+            .filter(|_| self.focused)
+            .filter(|c| active || c.style.shape != CursorShape::Block || self.hollow_inactive)
+            .filter(|c| !(solid && c.style.blinking && !self.cursor_on));
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
@@ -524,23 +555,38 @@ impl gpui::Element for TerminalElement {
                     _ => {}
                 }
             }
-            lines.push(shape_row(row, &theme, &mono, font_size, window));
+            match cursor.filter(|c| solid && c.style.shape == CursorShape::Block && c.row == row_ix)
+            {
+                Some(c) if c.col < row.len() => {
+                    let mut row = row.clone();
+                    row[c.col] = row[c.col].under_cursor();
+                    lines.push(shape_row(&row, &theme, &mono, font_size, window));
+                }
+                _ => lines.push(shape_row(row, &theme, &mono, font_size, window)),
+            }
         }
 
-        let cursor = snapshot.cursor.map(|c| {
-            let cursor_bounds = Bounds::new(
+        let cursor = cursor.map(|c| {
+            let cell = Bounds::new(
                 point(
                     origin.x + cell_w * c.col as f32,
                     origin.y + line_h * c.row as f32,
                 ),
                 size(cell_w, line_h),
             );
-            if self.focused {
-                // Translucent block: the glyph underneath stays legible.
-                fill(cursor_bounds, theme.cursor)
-            } else {
-                outline(cursor_bounds, theme.cursor, gpui::BorderStyle::Solid)
+            if !solid && c.style.shape == CursorShape::Block {
+                return outline(cell, theme.cursor, gpui::BorderStyle::Solid);
             }
+            let thickness = CURSOR_THICKNESS;
+            let bounds = match c.style.shape {
+                CursorShape::Block => cell,
+                CursorShape::Beam => Bounds::new(cell.origin, size(thickness, line_h)),
+                CursorShape::Underline => Bounds::new(
+                    point(cell.left(), cell.bottom() - thickness),
+                    size(cell_w, thickness),
+                ),
+            };
+            fill(bounds, theme.cursor)
         });
 
         TerminalPrepaint {
@@ -587,6 +633,10 @@ impl gpui::Element for TerminalElement {
                 window.paint_quad(quad);
             }
             paint_layer(Layer::UnderText, window);
+            // Under the text: the glyph in the cursor cell is cut out of it.
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
             let cell_w = prepaint.cell_w;
             for (ix, segments) in prepaint.lines.iter().enumerate() {
                 let y = origin.y + line_h * ix as f32;
@@ -602,9 +652,6 @@ impl gpui::Element for TerminalElement {
                 }
             }
             paint_layer(Layer::OverText, window);
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
-            }
         });
     }
 }

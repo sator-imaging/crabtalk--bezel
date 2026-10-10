@@ -12,6 +12,7 @@
 //! all real. Column *values* here are therefore arbitrary; their relationships
 //! are not, and the relationships are what broke.
 
+use editor::AppExt as _;
 use std::sync::Mutex;
 
 use editor::{Editor, ImageStore, Source};
@@ -100,6 +101,22 @@ fn open_scrolling_with(
 
 fn head(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> markdown::Cursor {
     cx.update(|_, cx| editor.read(cx).selection().head)
+}
+
+/// Where the caret painted last frame, and its line height.
+fn caret(
+    editor: &Entity<Editor>,
+    cx: &mut VisualTestContext,
+) -> (gpui::Point<gpui::Pixels>, gpui::Pixels) {
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        let selection = editor.selection();
+        editor
+            .layouts()
+            .position(selection.head, selection.affinity)
+            .expect("the caret painted")
+    })
 }
 
 fn source(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
@@ -442,6 +459,92 @@ fn down_does_not_stick_inside_a_wrapped_block(cx: &mut TestAppContext) {
     );
 }
 
+/// A soft wrap is one offset on two rows: Left from the start of a row
+/// crosses to the end of the row before without moving the offset.
+#[gpui::test]
+fn home_keeps_the_start_of_a_wrapped_row(cx: &mut TestAppContext) {
+    let text = "word ".repeat(80);
+    let (editor, _window, mut cx) = open_with(&text, cx);
+    cx.simulate_keystrokes("down right home");
+    let row_start = head(&editor, &mut cx);
+    assert!(row_start.offset > 0, "the test reached a wrapped row");
+
+    cx.simulate_keystrokes("left");
+    assert_eq!(head(&editor, &mut cx), row_start);
+    cx.simulate_keystrokes("left");
+    assert!(head(&editor, &mut cx).offset < row_start.offset);
+}
+
+/// End stays on its row, and Right first crosses to the start of the next.
+#[gpui::test]
+fn end_keeps_the_end_of_a_wrapped_row(cx: &mut TestAppContext) {
+    let text = "word ".repeat(80);
+    let (editor, _window, mut cx) = open_with(&text, cx);
+    cx.simulate_keystrokes("down right");
+    let (row, _) = caret(&editor, &mut cx);
+    cx.simulate_keystrokes("end");
+    let row_end = head(&editor, &mut cx);
+    assert!(
+        row_end.offset < text.len(),
+        "the test has another wrapped row"
+    );
+    let (end, _) = caret(&editor, &mut cx);
+    assert_eq!(end.y, row.y, "End paints on the row it was pressed on");
+
+    cx.simulate_keystrokes("right");
+    assert_eq!(head(&editor, &mut cx), row_end);
+    assert!(caret(&editor, &mut cx).0.y > row.y);
+    cx.simulate_keystrokes("right");
+    assert!(head(&editor, &mut cx).offset > row_end.offset);
+}
+
+#[gpui::test]
+fn home_in_wrapped_multibyte_inline_code_keeps_its_row(cx: &mut TestAppContext) {
+    let text = "日本語🙂 `some code` ".repeat(30);
+    let (editor, _window, mut cx) = open_with(&text, cx);
+    cx.simulate_keystrokes("down right home");
+    let row_start = head(&editor, &mut cx);
+    let body = cx.update(|_, cx| {
+        editor.read(cx).doc().blocks[0]
+            .text_at(markdown::Part::Body)
+            .unwrap()
+            .text
+            .clone()
+    });
+    assert!(body.is_char_boundary(row_start.offset));
+    assert!(row_start.offset > 0, "the test reached a wrapped row");
+
+    cx.simulate_keystrokes("left");
+    assert_eq!(head(&editor, &mut cx), row_start);
+}
+
+#[gpui::test]
+fn vertical_motion_uses_the_new_caret_after_enter(cx: &mut TestAppContext) {
+    let text = "word ".repeat(80);
+    let (editor, _window, mut cx) = open_with(&text, cx);
+    cx.simulate_keystrokes("down right right enter");
+    cx.run_until_parked();
+    let created = head(&editor, &mut cx);
+    assert_eq!(created.block, 1);
+    assert_eq!(created.offset, 0);
+
+    cx.simulate_keystrokes("up down");
+    assert_eq!(head(&editor, &mut cx), created);
+}
+
+#[gpui::test]
+fn vertical_motion_uses_the_new_caret_after_shift_enter(cx: &mut TestAppContext) {
+    let text = "word ".repeat(80);
+    let (editor, _window, mut cx) = open_with(&text, cx);
+    cx.simulate_keystrokes("down right right shift-enter");
+    cx.run_until_parked();
+    let created = head(&editor, &mut cx);
+    assert!(created.offset > 0);
+
+    cx.simulate_keystrokes("up down");
+    assert_eq!(head(&editor, &mut cx), created);
+}
+
 #[gpui::test]
 fn up_retraces_the_path_down(cx: &mut TestAppContext) {
     let (editor, _window, mut cx) = open(cx);
@@ -457,6 +560,37 @@ fn up_retraces_the_path_down(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_selection_held_past_the_bottom_scrolls_and_extends(cx: &mut TestAppContext) {
+    let source: String = (0..40).map(|ix| format!("line {ix}\n\n")).collect();
+    let (editor, mut cx) = open_scrolling_with(&source, cx);
+    let start = cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        let (at, line) = editor
+            .layouts()
+            .position(
+                markdown::Cursor::new(0, markdown::Part::Body, 0),
+                markdown::Affinity::Downstream,
+            )
+            .unwrap();
+        at + point(px(1.0), line / 2.0)
+    });
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let past = point(start.x, px(120.0));
+    cx.simulate_mouse_move(past, gpui::MouseButton::Left, gpui::Modifiers::default());
+    // The pointer holds still; only the timer moves anything now.
+    let reached = head(&editor, &mut cx).block;
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    cx.simulate_mouse_up(past, gpui::MouseButton::Left, gpui::Modifiers::default());
+
+    assert!(
+        head(&editor, &mut cx).block > reached,
+        "the selection grew past block {reached}"
+    );
+}
+
+#[gpui::test]
 fn vertical_motion_keeps_its_row_while_scrolling(cx: &mut TestAppContext) {
     let source = "word ".repeat(100);
     let (editor, mut cx) = open_scrolling_with(&source, cx);
@@ -466,7 +600,7 @@ fn vertical_motion_keeps_its_row_while_scrolling(cx: &mut TestAppContext) {
         let editor = editor.read(cx);
         editor
             .layouts()
-            .position(editor.selection().head)
+            .position(editor.selection().head, editor.selection().affinity)
             .unwrap()
             .0
             .y
@@ -482,7 +616,7 @@ fn vertical_motion_keeps_its_row_while_scrolling(cx: &mut TestAppContext) {
         let editor = editor.read(cx);
         editor
             .layouts()
-            .position(editor.selection().head)
+            .position(editor.selection().head, editor.selection().affinity)
             .unwrap()
             .0
             .y
@@ -824,6 +958,22 @@ fn a_second_press_on_the_handle_leaves_the_block_menu_shut(cx: &mut TestAppConte
     );
 }
 
+#[gpui::test]
+fn the_block_menu_keeps_quotes_behind_a_submenu(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("hello", cx);
+    cx.run_until_parked();
+    let handle = cx.debug_bounds(editor::BLOCK_HANDLE).unwrap();
+    cx.simulate_click(handle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("block-menu/Quote").is_some());
+    assert!(cx.debug_bounds("block-menu/Quote (Note)").is_none());
+
+    // Text through Task, then the Quote group; into it, past plain Quote.
+    cx.simulate_keystrokes("down down down down down down down down right down enter");
+    cx.run_until_parked();
+    assert_eq!(source(&editor, &mut cx), "> [!NOTE]\n> hello");
+}
+
 /// Copying a file in a file manager rather than dragging it. macOS puts the
 /// path on the clipboard as text beside the file itself, and the text is not
 /// the picture — which is the whole of the bug this answers.
@@ -912,13 +1062,10 @@ fn copy_file(path: &str, cx: &mut VisualTestContext) {
 fn the_store_is_told_which_editor_is_asking(cx: &mut TestAppContext) {
     let (editor, _window, mut cx) = open_with("", cx);
     cx.update(|_, cx| {
-        editor::set_image_store(
-            cx,
-            ImageStore {
-                keep,
-                ..ImageStore::default()
-            },
-        )
+        cx.set_image_store(ImageStore {
+            keep,
+            ..ImageStore::default()
+        })
     });
     copy_file("/My Notes/shot.png", &mut cx);
     cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
@@ -937,13 +1084,10 @@ fn the_store_is_told_which_editor_is_asking(cx: &mut TestAppContext) {
 fn a_store_decides_for_itself_what_a_picture_is(cx: &mut TestAppContext) {
     let (editor, _window, mut cx) = open_with("", cx);
     cx.update(|_, cx| {
-        editor::set_image_store(
-            cx,
-            ImageStore {
-                keep,
-                accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
-            },
-        )
+        cx.set_image_store(ImageStore {
+            keep,
+            accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
+        })
     });
     copy_file("/My Notes/shot.heic", &mut cx);
     cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
@@ -956,13 +1100,10 @@ fn a_store_decides_for_itself_what_a_picture_is(cx: &mut TestAppContext) {
 fn a_file_the_store_refuses_pastes_as_its_path(cx: &mut TestAppContext) {
     let (editor, _window, mut cx) = open_with("", cx);
     cx.update(|_, cx| {
-        editor::set_image_store(
-            cx,
-            ImageStore {
-                keep,
-                accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
-            },
-        )
+        cx.set_image_store(ImageStore {
+            keep,
+            accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
+        })
     });
     copy_file("/My Notes/shot.png", &mut cx);
     cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
@@ -1019,6 +1160,55 @@ fn typing_in_the_source_is_typing_in_the_document(cx: &mut TestAppContext) {
             text: markdown::Text::plain("Title"),
         },
         "a `#` typed into the markup is a heading level when the document comes back"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn ctrl_k_in_the_source_kills_to_the_end_of_the_line(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title\n\nbody", cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("home ctrl-k");
+    assert_eq!(
+        source(&editor, &mut cx),
+        "\n\nbody",
+        "the line, not the rest"
+    );
+    cx.simulate_keystrokes("ctrl-k");
+    assert_eq!(
+        source(&editor, &mut cx),
+        "\nbody",
+        "at its end, the newline"
+    );
+}
+
+#[gpui::test]
+fn a_triple_click_in_the_source_selects_one_line(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title\n\nbody", cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    let at = cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        let (at, line_height) = editor
+            .layouts()
+            .position(editor.selection().head, editor.selection().affinity)
+            .unwrap();
+        point(at.x, at.y + line_height / 2.)
+    });
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: at,
+        button: gpui::MouseButton::Left,
+        modifiers: gpui::Modifiers::default(),
+        click_count: 3,
+        first_mouse: false,
+    });
+    cx.simulate_mouse_up(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let (start, end) = cx.update(|_, cx| editor.read(cx).selection().ordered());
+    assert_eq!(
+        (start.offset, end.offset),
+        (0, "# Title".len()),
+        "the line, not the source"
     );
 }
 
@@ -1467,13 +1657,10 @@ fn a_copy_inside_a_code_block_is_the_code(cx: &mut TestAppContext) {
 fn the_store_is_handed_the_editors_base(cx: &mut TestAppContext) {
     let (editor, mut cx) = open_built("", |editor| editor.with_base("/notes/article"), cx);
     cx.update(|_, cx| {
-        editor::set_image_store(
-            cx,
-            ImageStore {
-                keep,
-                ..ImageStore::default()
-            },
-        )
+        cx.set_image_store(ImageStore {
+            keep,
+            ..ImageStore::default()
+        })
     });
     copy_file("/My Notes/shot.png", &mut cx);
     cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
@@ -1506,4 +1693,391 @@ fn the_highlight_chord_does_nothing_without_the_mark(cx: &mut TestAppContext) {
     let (editor, _window, mut cx) = open_with("a lit word", cx);
     cx.simulate_keystrokes(&format!("{PRIMARY}-a {PRIMARY}-shift-h"));
     assert_eq!(source(&editor, &mut cx), "a lit word");
+}
+
+#[gpui::test]
+fn a_table_row_handle_survives_the_pointer_crossing_cell_padding(cx: &mut TestAppContext) {
+    let (editor, _, mut cx) = open_with(
+        "paragraph\n\n| A | B |\n| --- | --- |\n| first | row |\n| second | row |",
+        cx,
+    );
+    let (table, cell) = cx.update(|_, cx| {
+        let layouts = editor.read(cx).layouts();
+        (
+            layouts.block_bounds(1).unwrap(),
+            layouts
+                .cell_bounds(1, markdown::Part::Cell { row: 1, column: 0 })
+                .unwrap(),
+        )
+    });
+    let mut x = cell.center().x;
+    while x >= table.left() {
+        cx.simulate_mouse_move(point(x, cell.center().y), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("table-row-handle").is_some(),
+            "handle disappeared at {x:?}; table {table:?}; cell {cell:?}"
+        );
+        x -= px(1.0);
+    }
+    let bounds = cx.debug_bounds("table-row-handle").unwrap();
+    assert!(bounds.left() >= table.left() && bounds.right() <= cell.left());
+    assert!((bounds.center().y - cell.center().y).abs() < px(1.0));
+    let handle = bounds.center();
+    cx.simulate_click(handle, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let delete = cx
+        .debug_bounds("table-menu/Delete row")
+        .expect("delete row menu item");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!source(&editor, &mut cx).contains("first"));
+}
+
+#[gpui::test]
+fn table_add_controls_fit_inside_the_block_without_covering_cells(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open_scrolling_with(TABLE, cx);
+    cx.simulate_resize(size(px(360.0), px(600.0)));
+    cx.run_until_parked();
+    cx.simulate_mouse_move(point(px(50.0), px(30.0)), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (table, last) = cx.update(|_, cx| {
+        let layouts = editor.read(cx).layouts();
+        (
+            layouts.block_bounds(0).unwrap(),
+            layouts
+                .cell_bounds(0, markdown::Part::Cell { row: 1, column: 1 })
+                .unwrap(),
+        )
+    });
+    let add_row = cx.debug_bounds("table-add-row").expect("add row");
+    let add_column = cx.debug_bounds("table-add-column").expect("add column");
+    for bounds in [add_row, add_column] {
+        assert!(bounds.left() >= table.left() && bounds.right() <= table.right());
+        assert!(bounds.top() >= table.top() && bounds.bottom() <= table.bottom());
+    }
+    assert!(last.right() <= add_column.left());
+    assert!(last.bottom() <= add_row.top());
+    cx.simulate_click(add_row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        source(&editor, &mut cx),
+        "| a | b |\n| --- | --- |\n| c | d |\n|  |  |"
+    );
+    let add_column = cx.debug_bounds("table-add-column").unwrap();
+    cx.simulate_click(add_column.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        source(&editor, &mut cx),
+        "| a | b |  |\n| --- | --- | --- |\n| c | d |  |\n|  |  |  |"
+    );
+}
+
+#[gpui::test]
+fn a_table_column_handle_survives_the_pointer_crossing_cell_padding(cx: &mut TestAppContext) {
+    let (editor, _, mut cx) = open_with(
+        "paragraph\n\n| A | B |\n| --- | --- |\n| first | second |",
+        cx,
+    );
+    let (table, cell) = cx.update(|_, cx| {
+        let layouts = editor.read(cx).layouts();
+        (
+            layouts.block_bounds(1).unwrap(),
+            layouts
+                .cell_bounds(1, markdown::Part::Cell { row: 0, column: 1 })
+                .unwrap(),
+        )
+    });
+    let mut y = cell.center().y;
+    while y >= table.top() {
+        cx.simulate_mouse_move(point(cell.center().x, y), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("table-column-handle").is_some());
+        y -= px(1.0);
+    }
+    let bounds = cx.debug_bounds("table-column-handle").unwrap();
+    assert!(
+        bounds.top() >= table.top() && bounds.bottom() <= cell.top(),
+        "handle {bounds:?}; table {table:?}; cell {cell:?}"
+    );
+    assert!((bounds.center().x - cell.center().x).abs() < px(1.0));
+    let handle = bounds.center();
+    cx.simulate_click(handle, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let delete = cx
+        .debug_bounds("table-menu/Delete column")
+        .expect("delete column menu item");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!source(&editor, &mut cx).contains("second"));
+}
+
+#[gpui::test]
+fn a_scrolled_table_cell_can_delete_its_row_or_column(cx: &mut TestAppContext) {
+    for label in ["table-menu/Delete row", "table-menu/Delete column"] {
+        let original = format!(
+            "| A | B |\n| --- | --- |\n{}",
+            (0..20)
+                .map(|row| format!("| a{row} | b{row} |"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (editor, mut cx) = open_scrolling_with(&original, cx);
+        cx.simulate_resize(size(px(360.0), px(320.0)));
+        editor.update(&mut cx, |editor, cx| {
+            editor.select(
+                markdown::Selection::at(markdown::Cursor::new(
+                    0,
+                    markdown::Part::Cell { row: 12, column: 1 },
+                    0,
+                )),
+                cx,
+            )
+        });
+        for _ in 0..8 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        let (table, cell, before) = cx.update(|_, cx| {
+            let editor = editor.read(cx);
+            (
+                editor.layouts().block_bounds(0).unwrap(),
+                editor
+                    .layouts()
+                    .cell_bounds(0, markdown::Part::Cell { row: 12, column: 1 })
+                    .unwrap(),
+                editor.selection(),
+            )
+        });
+        assert!(table.top() < px(0.0), "the header is scrolled away");
+        cx.simulate_mouse_down(
+            cell.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            cell.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(&cx, |editor, _| editor.selection()),
+            before
+        );
+        let action = cx.debug_bounds(label).expect("cell context menu deletion");
+        cx.simulate_click(action.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let changed = source(&editor, &mut cx);
+        assert!(!changed.contains("b11"));
+        if label == "table-menu/Delete row" {
+            assert!(!changed.contains("a11"));
+            assert!(changed.contains("b12"));
+        } else {
+            assert!(changed.contains("a11"));
+            assert!(!changed.contains("b12"));
+        }
+        cx.simulate_keystrokes(&format!("{PRIMARY}-z"));
+        assert_eq!(source(&editor, &mut cx), original);
+    }
+}
+
+#[gpui::test]
+fn table_moves_from_the_menu_are_undoable(cx: &mut TestAppContext) {
+    let original = "| A | B |\n| --- | --- |\n| one | first |\n| two | second |\n| three | third |";
+    for (selector, label, expected) in [
+        (
+            "table-row-handle",
+            "table-menu/Move down",
+            "| A | B |\n| --- | --- |\n| two | second |\n| one | first |\n| three | third |",
+        ),
+        (
+            "table-column-handle",
+            "table-menu/Move right",
+            "| B | A |\n| --- | --- |\n| first | one |\n| second | two |\n| third | three |",
+        ),
+    ] {
+        let (editor, _, mut cx) = open_with(original, cx);
+        let cell = cx.update(|_, cx| {
+            editor
+                .read(cx)
+                .layouts()
+                .cell_bounds(0, markdown::Part::Cell { row: 1, column: 0 })
+                .unwrap()
+        });
+        cx.simulate_mouse_move(cell.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let handle = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(handle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let action = cx.debug_bounds(label).expect("movement action");
+        cx.simulate_click(action.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(source(&editor, &mut cx), expected);
+        cx.simulate_keystrokes(&format!("{PRIMARY}-z"));
+        assert_eq!(source(&editor, &mut cx), original);
+    }
+}
+
+#[gpui::test]
+fn dragging_table_handles_reorders_without_opening_the_menu(cx: &mut TestAppContext) {
+    let original = "| A | B |\n| --- | --- |\n| one | first |\n| two | second |\n| three | third |";
+    for row in [true, false] {
+        let (editor, _, mut cx) = open_with(original, cx);
+        let (first, last) = cx.update(|_, cx| {
+            let layouts = editor.read(cx).layouts();
+            (
+                layouts
+                    .cell_bounds(0, markdown::Part::Cell { row: 1, column: 0 })
+                    .unwrap(),
+                layouts
+                    .cell_bounds(
+                        0,
+                        if row {
+                            markdown::Part::Cell { row: 3, column: 0 }
+                        } else {
+                            markdown::Part::Cell { row: 1, column: 1 }
+                        },
+                    )
+                    .unwrap(),
+            )
+        });
+        cx.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let handle = cx
+            .debug_bounds(if row {
+                "table-row-handle"
+            } else {
+                "table-column-handle"
+            })
+            .unwrap()
+            .center();
+        let target = if row {
+            point(handle.x, last.center().y)
+        } else {
+            point(last.center().x, handle.y)
+        };
+        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("table-drop").is_some());
+        cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let expected = if row {
+            "| A | B |\n| --- | --- |\n| two | second |\n| three | third |\n| one | first |"
+        } else {
+            "| B | A |\n| --- | --- |\n| first | one |\n| second | two |\n| third | three |"
+        };
+        assert_eq!(source(&editor, &mut cx), expected);
+        assert!(cx.debug_bounds("table-menu/Delete row").is_none());
+        assert!(cx.debug_bounds("table-menu/Delete column").is_none());
+        cx.simulate_keystrokes(&format!("{PRIMARY}-z"));
+        assert_eq!(source(&editor, &mut cx), original);
+    }
+}
+
+#[gpui::test]
+fn table_reordering_carries_the_selection_and_anchors(cx: &mut TestAppContext) {
+    use markdown::{Cursor, Part, Selection};
+    let original = "| A | B |\n| --- | --- |\n| one | first |\n| two | second |\n| three | third |";
+    let (editor, _, mut cx) = open_with(original, cx);
+    let at = |row, column, offset| Cursor::new(0, Part::Cell { row, column }, offset);
+    let anchored = Selection::new(at(1, 0, 0), at(1, 0, 3));
+    let selected = Selection::at(at(2, 1, 2));
+    editor.update(&mut cx, |editor, cx| {
+        editor.set_anchors(vec![editor::Anchor::new(editor::AnchorId(1), anchored)], cx);
+        editor.select(selected, cx);
+        editor.move_row(0, 1, 3, cx);
+        assert_eq!(
+            editor.anchors()[0].range,
+            Selection::new(at(3, 0, 0), at(3, 0, 3))
+        );
+        assert_eq!(editor.selection(), Selection::at(at(1, 1, 2)));
+        editor.move_column(0, 0, 1, cx);
+        assert_eq!(
+            editor.anchors()[0].range,
+            Selection::new(at(3, 1, 0), at(3, 1, 3))
+        );
+        assert_eq!(editor.selection(), Selection::at(at(1, 0, 2)));
+    });
+    cx.simulate_keystrokes(&format!("{PRIMARY}-z {PRIMARY}-z"));
+    assert_eq!(source(&editor, &mut cx), original);
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).anchors()[0].range, anchored);
+        assert_eq!(editor.read(cx).selection(), selected);
+    });
+}
+
+#[gpui::test]
+fn table_drags_can_be_cancelled(cx: &mut TestAppContext) {
+    let original = "| A | B |\n| --- | --- |\n| one | first |\n| two | second |";
+    for escape in [true, false] {
+        let (editor, _, mut cx) = open_with(original, cx);
+        let cell = cx.update(|_, cx| {
+            editor
+                .read(cx)
+                .layouts()
+                .cell_bounds(0, markdown::Part::Cell { row: 1, column: 0 })
+                .unwrap()
+        });
+        cx.simulate_mouse_move(cell.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let start = cx.debug_bounds("table-row-handle").unwrap().center();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let to = if escape {
+            start + point(px(0.0), cell.size.height)
+        } else {
+            point(px(350.0), px(580.0))
+        };
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        if escape {
+            cx.simulate_keystrokes("escape");
+        }
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(source(&editor, &mut cx), original);
+        assert!(cx.debug_bounds("table-drop").is_none());
+    }
+}
+
+/// A right press on text opens the edit menu, and its rows act on the
+/// document.
+#[gpui::test]
+fn a_right_press_on_text_opens_the_edit_menu(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open(cx);
+    let at = cx.update(|_, cx| {
+        let (at, line) = editor
+            .read(cx)
+            .layouts()
+            .position(
+                markdown::Cursor::new(1, markdown::Part::Body, 0),
+                markdown::Affinity::Downstream,
+            )
+            .unwrap();
+        at + point(px(1.0), line / 2.0)
+    });
+    cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.simulate_mouse_up(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        head(&editor, &mut cx).block,
+        1,
+        "the caret goes to the press"
+    );
+    let select_all = cx
+        .debug_bounds("text-menu/Select All")
+        .expect("the menu is open");
+    cx.simulate_click(select_all.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        assert_eq!(
+            editor.selection(),
+            markdown::Selection::all(editor.doc()),
+            "Select All selected the document"
+        );
+    });
 }

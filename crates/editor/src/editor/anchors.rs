@@ -15,6 +15,9 @@ impl Editor {
     /// Hand over the whole list — the app keeps the threads, this keeps their
     /// ranges. One entry point rather than add/remove/update, since the app is
     /// already holding the list that decides all three.
+    ///
+    /// Ranges are positions in [`Self::doc`] as it stands: the source fence in
+    /// [`Mode::Source`], the blocks otherwise.
     pub fn set_anchors(&mut self, anchors: Vec<Anchor>, cx: &mut Context<Self>) {
         self.anchors = anchors;
         cx.notify();
@@ -26,7 +29,7 @@ impl Editor {
     /// The last match wins, so the newer of two overlapping ranges is the one a
     /// click opens.
     pub fn anchor_at(&self, at: gpui::Point<gpui::Pixels>) -> Option<AnchorId> {
-        let at = self.layouts.hit(at)?;
+        let (at, _) = self.layouts.hit(at)?;
         self.anchors
             .iter()
             .rfind(|anchor| {
@@ -39,7 +42,9 @@ impl Editor {
     /// Where to float a thread, mirroring [`Self::selection_bounds`].
     pub fn anchor_bounds(&self, id: AnchorId) -> Option<gpui::Bounds<gpui::Pixels>> {
         let anchor = self.anchors.iter().find(|anchor| anchor.id == id)?;
-        let (point, line_height) = self.layouts.position(anchor.range.ordered().0)?;
+        let (point, line_height) = self
+            .layouts
+            .position(anchor.range.ordered().0, Affinity::Downstream)?;
         Some(gpui::Bounds::new(
             point,
             gpui::size(gpui::px(0.0), line_height),

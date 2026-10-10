@@ -12,6 +12,10 @@
 //!
 //! This half is pure, so the motion is testable without a window.
 
+use std::ops::Range;
+
+use ui::input::Granularity;
+
 use crate::doc::{Doc, Part};
 
 /// A caret: which block, which part of it, and how far into that part.
@@ -275,6 +279,62 @@ impl Cursor {
             ..here
         }
     }
+
+    /// The span of `unit` holding the caret, inside its own part. A word is
+    /// the run of alphanumerics the caret touches, or of anything else when it
+    /// touches none; a line runs between the part's newlines. A mention is never split.
+    pub fn span(self, unit: Granularity, doc: &Doc) -> Range<Self> {
+        let here = self.clamp(doc);
+        let Some(text) = doc
+            .blocks
+            .get(here.block)
+            .and_then(|b| b.text_at(here.part))
+        else {
+            return here..here;
+        };
+        let (start, end) = match unit {
+            Granularity::Char => return here..here,
+            Granularity::Line => (
+                ui::input::line_start(&text.text, here.offset),
+                ui::input::line_end(&text.text, here.offset),
+            ),
+            Granularity::Word => {
+                let (head, tail) = text.text.split_at(here.offset);
+                let word = head.chars().next_back().is_some_and(char::is_alphanumeric)
+                    || tail.chars().next().is_some_and(char::is_alphanumeric);
+                let same = |c: &char| c.is_alphanumeric() == word;
+                let back: usize = head
+                    .chars()
+                    .rev()
+                    .take_while(same)
+                    .map(char::len_utf8)
+                    .sum();
+                let ahead: usize = tail.chars().take_while(same).map(char::len_utf8).sum();
+                (here.offset - back, here.offset + ahead)
+            }
+        };
+        let start = text.mention_around(start).map_or(start, |m| m.start);
+        let end = text.mention_around(end).map_or(end, |m| m.end);
+        Self {
+            offset: start,
+            ..here
+        }..Self {
+            offset: end,
+            ..here
+        }
+    }
+}
+
+/// Which painted row the head of a [`Selection`] sits on when its offset is a
+/// soft wrap, where one offset both ends a row and starts the next. Anywhere
+/// else it changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Affinity {
+    /// The start of the row after the wrap.
+    #[default]
+    Downstream,
+    /// The end of the row before the wrap.
+    Upstream,
 }
 
 /// A range in the document: where the selection started, and where it is being
@@ -287,6 +347,8 @@ impl Cursor {
 pub struct Selection {
     pub anchor: Cursor,
     pub head: Cursor,
+    /// The head's row at a soft wrap.
+    pub affinity: Affinity,
 }
 
 impl From<Cursor> for Selection {
@@ -298,14 +360,19 @@ impl From<Cursor> for Selection {
 impl Selection {
     /// A collapsed selection — a plain caret.
     pub fn at(cursor: Cursor) -> Self {
-        Self {
-            anchor: cursor,
-            head: cursor,
-        }
+        Self::new(cursor, cursor)
     }
 
     pub fn new(anchor: Cursor, head: Cursor) -> Self {
-        Self { anchor, head }
+        Self {
+            anchor,
+            head,
+            affinity: Affinity::Downstream,
+        }
+    }
+
+    pub fn with_affinity(self, affinity: Affinity) -> Self {
+        Self { affinity, ..self }
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -319,13 +386,14 @@ impl Selection {
 
     /// Move the head, leaving the anchor — every shift+motion and every drag.
     pub fn extend_to(self, head: Cursor) -> Self {
-        Self { head, ..self }
+        Self::new(self.anchor, head)
     }
 
     pub fn clamp(self, doc: &Doc) -> Self {
         Self {
             anchor: self.anchor.clamp(doc),
             head: self.head.clamp(doc),
+            ..self
         }
     }
 
