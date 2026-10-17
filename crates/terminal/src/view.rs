@@ -13,7 +13,7 @@
 //!   cols×rows back to the host through its grid callback, and paints the
 //!   grid: background quads for non-default cells, one `ShapedLine` per row
 //!   (same font whatever the colors — paint never changes layout), and the
-//!   cursor block.
+//!   cursor in its shape.
 
 use gpui::{
     App, Bounds, Edges, GlobalElementId, Hsla, KeyLayout, LayoutId, Modifiers, PaintQuad, Pixels,
@@ -21,6 +21,7 @@ use gpui::{
     relative, size,
 };
 
+use crate::glyph;
 use theme::{Appearance, Theme};
 
 use std::{
@@ -30,7 +31,7 @@ use std::{
 };
 
 use crate::emulator::{
-    CellColor, CellSnapshot, CursorSnapshot, Emulator, Frame, KeyboardMode, MouseMode,
+    CellColor, CellSnapshot, CursorShape, CursorSnapshot, Emulator, Frame, KeyboardMode, MouseMode,
     MouseTracking, Side, Source,
 };
 
@@ -47,6 +48,9 @@ pub use palette::*;
 /// Terminal font metrics (mono).
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
+
+/// How thick a beam or underline cursor paints.
+const CURSOR_THICKNESS: Pixels = px(2.0);
 
 /// Keyboard input coalescing window before a PTY write flush.
 pub const COALESCE_MS: u64 = 12;
@@ -219,6 +223,8 @@ type GridHook = Box<dyn Fn(GridGeometry, &mut App) -> Option<GridSnapshot>>;
 pub struct TerminalElement {
     grid: GridHook,
     focused: bool,
+    cursor_on: bool,
+    hollow_inactive: bool,
     font_size: f32,
     inset: Edges<Pixels>,
 }
@@ -231,6 +237,8 @@ impl TerminalElement {
         Self {
             grid: Box::new(grid),
             focused,
+            cursor_on: true,
+            hollow_inactive: true,
             font_size: TERM_FONT_SIZE,
             inset: Edges::default(),
         }
@@ -245,6 +253,21 @@ impl TerminalElement {
         self
     }
 
+    /// Which half of its blink a blinking cursor is in. The element has no
+    /// timer: the host flips this to blink. Defaults to on; a steady cursor and
+    /// an unfocused one ignore it.
+    pub fn with_cursor_on(mut self, on: bool) -> Self {
+        self.cursor_on = on;
+        self
+    }
+
+    /// Whether a block cursor shows outlined while its window is inactive,
+    /// rather than not at all. Defaults to on.
+    pub fn with_hollow_inactive(mut self, hollow: bool) -> Self {
+        self.hollow_inactive = hollow;
+        self
+    }
+
     /// Inset the grid from the element's bounds. Cols and rows are measured
     /// from the bounds minus the inset; the margin is still inside the
     /// element's bounds for hit-testing. Defaults to zero.
@@ -253,14 +276,20 @@ impl TerminalElement {
         self
     }
 
-    fn line_height(&self) -> f32 {
-        self.font_size * TERM_LINE_HEIGHT / TERM_FONT_SIZE
+    /// Row pitch in logical pixels, a whole number of device pixels.
+    fn line_height(&self, scale: f32) -> f32 {
+        (self.font_size * TERM_LINE_HEIGHT / TERM_FONT_SIZE * scale)
+            .round()
+            .max(1.0)
+            / scale
     }
 
-    fn grid_origin(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
+    /// Grid origin on the device-pixel grid, so row edges share exact pixels.
+    fn grid_origin(&self, bounds: Bounds<Pixels>, scale: f32) -> Point<Pixels> {
+        let snap = |value: Pixels| Pixels::from((f32::from(value) * scale).floor() / scale);
         point(
-            bounds.left() + self.inset.left,
-            bounds.top() + self.inset.top,
+            snap(bounds.left() + self.inset.left),
+            snap(bounds.top() + self.inset.top),
         )
     }
 }
@@ -309,6 +338,17 @@ pub struct TerminalPrepaint {
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
     cursor: Option<PaintQuad>,
+    covered: Option<Covered>,
+}
+
+/// The glyph under a solid block cursor, for [`ui::input::caret::paint_covered`].
+struct Covered {
+    line: ShapedLine,
+    /// Within `line`.
+    range: std::ops::Range<usize>,
+    /// The top left of its slot.
+    at: Point<Pixels>,
+    color: Hsla,
 }
 
 impl gpui::IntoElement for TerminalElement {
@@ -376,7 +416,8 @@ impl gpui::Element for TerminalElement {
             .text_system()
             .em_advance(font_id, font_size)
             .unwrap_or(px(self.font_size * 0.6));
-        let line_h = px(self.line_height());
+        let scale = window.scale_factor();
+        let line_h = px(self.line_height(scale));
 
         let inner_w = f32::from(bounds.size.width - self.inset.left - self.inset.right);
         let inner_h = f32::from(bounds.size.height - self.inset.top - self.inset.bottom);
@@ -384,7 +425,7 @@ impl gpui::Element for TerminalElement {
         let rows = ((inner_h / f32::from(line_h)).floor() as i64).clamp(1, 500) as u16;
 
         // Report the measured grid, then snapshot for painting.
-        let origin = self.grid_origin(bounds);
+        let origin = self.grid_origin(bounds, scale);
         let snapshot = (self.grid)(
             GridGeometry {
                 origin,
@@ -403,6 +444,7 @@ impl gpui::Element for TerminalElement {
                 lines: Vec::new(),
                 cell_w,
                 cursor: None,
+                covered: None,
             };
         };
 
@@ -471,6 +513,15 @@ impl gpui::Element for TerminalElement {
             .collect();
         images.sort_by_key(|painted| painted.order);
 
+        // Only a focused grid has a cursor. In an inactive window a block is
+        // outlined, or not there; a beam or an underline is unchanged.
+        let active = window.is_window_active();
+        let solid = self.focused && active;
+        let cursor = snapshot
+            .cursor
+            .filter(|_| self.focused)
+            .filter(|c| active || c.style.shape != CursorShape::Block || self.hollow_inactive)
+            .filter(|c| !(solid && c.style.blinking && !self.cursor_on));
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
@@ -524,23 +575,76 @@ impl gpui::Element for TerminalElement {
                     _ => {}
                 }
             }
+            for (col, cell) in row.iter().enumerate() {
+                if cell.hidden || !glyph::covers(cell.ch) {
+                    continue;
+                }
+                let cell_bounds = Bounds::new(
+                    point(origin.x + cell_w * col as f32, y),
+                    size(cell_w, line_h),
+                );
+                bg_quads.extend(glyph::fills(cell.ch, cell_bounds, ink(cell, &theme)));
+            }
             lines.push(shape_row(row, &theme, &mono, font_size, window));
         }
 
-        let cursor = snapshot.cursor.map(|c| {
-            let cursor_bounds = Bounds::new(
+        // The glyph a solid block covers: the one in the segment its column
+        // falls in, painted again over the block.
+        let covered = cursor
+            .filter(|c| solid && c.style.shape == CursorShape::Block)
+            .and_then(|c| {
+                let cell = snapshot.lines.get(c.row)?.get(c.col)?;
+                let (col, line) = lines
+                    .get(c.row)?
+                    .iter()
+                    .rev()
+                    .find(|(col, _)| *col <= c.col)?;
+                // A segment of ASCII holds a cell per byte; any other holds
+                // the one glyph its column starts.
+                let range = match line.text.is_ascii() {
+                    true => c.col - col..c.col - col + 1,
+                    false => 0..line.len(),
+                };
+                Some(Covered {
+                    at: point(
+                        origin.x + cell_w * *col as f32 + line.x_for_index(range.start),
+                        origin.y + line_h * c.row as f32,
+                    ),
+                    line: line.clone(),
+                    range,
+                    color: {
+                        let page = resolve_color(cell.display_colors().1, &theme);
+                        theme::ink_over(
+                            glyph_color(cell, &theme),
+                            page,
+                            page,
+                            theme::stack(page, [theme.cursor]),
+                        )
+                    },
+                })
+            });
+
+        let cursor = cursor.map(|c| {
+            let cell = Bounds::new(
                 point(
                     origin.x + cell_w * c.col as f32,
                     origin.y + line_h * c.row as f32,
                 ),
                 size(cell_w, line_h),
             );
-            if self.focused {
-                // Translucent block: the glyph underneath stays legible.
-                fill(cursor_bounds, theme.cursor)
-            } else {
-                outline(cursor_bounds, theme.cursor, gpui::BorderStyle::Solid)
+            if !solid && c.style.shape == CursorShape::Block {
+                return outline(cell, theme.cursor, gpui::BorderStyle::Solid);
             }
+            let thickness = CURSOR_THICKNESS;
+            let bounds = match c.style.shape {
+                CursorShape::Block => cell,
+                CursorShape::Beam => Bounds::new(cell.origin, size(thickness, line_h)),
+                CursorShape::Underline => Bounds::new(
+                    point(cell.left(), cell.bottom() - thickness),
+                    size(cell_w, thickness),
+                ),
+            };
+            fill(bounds, theme.cursor)
         });
 
         TerminalPrepaint {
@@ -550,6 +654,7 @@ impl gpui::Element for TerminalElement {
             lines,
             cell_w,
             cursor,
+            covered,
         }
     }
 
@@ -563,8 +668,9 @@ impl gpui::Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_h = px(self.line_height());
-        let origin = self.grid_origin(bounds);
+        let scale = window.scale_factor();
+        let line_h = px(self.line_height(scale));
+        let origin = self.grid_origin(bounds, scale);
         window.with_content_mask(Some(gpui::ContentMask::new(bounds)), |window| {
             let images = std::mem::take(&mut prepaint.images);
             let paint_layer = |layer: Layer, window: &mut Window| {
@@ -601,12 +707,44 @@ impl gpui::Element for TerminalElement {
                     );
                 }
             }
-            paint_layer(Layer::OverText, window);
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
+            if let Some(covered) = prepaint.covered.take() {
+                ui::input::caret::paint_covered(
+                    &covered.line,
+                    &covered.range,
+                    covered.at,
+                    line_h,
+                    covered.color,
+                    window,
+                );
+            }
+            paint_layer(Layer::OverText, window);
         });
     }
+}
+
+/// The colour a cell's glyph is painted in, dimmed when the cell is dim.
+fn glyph_color(cell: &CellSnapshot, theme: &Theme) -> Hsla {
+    let (fg, _) = cell.display_colors();
+    let mut color = resolve_color(fg, theme);
+    if cell.dim {
+        color.a *= 0.6;
+    }
+    color
+}
+
+/// The color a cell's glyph is drawn in: its own, and legible over the
+/// selection while the cell is selected.
+fn ink(cell: &CellSnapshot, theme: &Theme) -> Hsla {
+    let color = glyph_color(cell, theme);
+    if !cell.selected {
+        return color;
+    }
+    let page = resolve_color(cell.display_colors().1, theme);
+    let plate = theme::stack(page, [terminal_selection_for(theme.appearance)]);
+    theme::ink_over(color, page, page, plate)
 }
 
 /// Shape one grid row into COLUMN-PINNED segments.
@@ -665,7 +803,8 @@ fn shape_row(
         }
         // Tab stops are already expanded in the grid. Paint the stored tab
         // marker as one blank cell so the shaper cannot expand it again.
-        let ch = if cell.hidden || cell.ch == '\t' {
+        // Box and block characters are painted as geometry, see `glyph::fills`.
+        let ch = if cell.hidden || cell.ch == '\t' || glyph::covers(cell.ch) {
             ' '
         } else {
             cell.ch
@@ -685,11 +824,7 @@ fn shape_row(
         if text.is_empty() {
             seg_col = col;
         }
-        let (fg, _) = cell.display_colors();
-        let mut color = resolve_color(fg, theme);
-        if cell.dim {
-            color.a *= 0.6;
-        }
+        let color = ink(cell, theme);
         let mut cell_font = mono.clone();
         cell_font.weight = if cell.bold {
             gpui::FontWeight::BOLD

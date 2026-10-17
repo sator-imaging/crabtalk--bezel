@@ -165,7 +165,8 @@ fn code_blocks_keep_their_language_and_drop_the_fence_newline() {
             0,
             BlockKind::Code {
                 language: Some("rust".into()),
-                code: Text::plain("fn main() {}")
+                code: Text::plain("fn main() {}"),
+                height: None,
             }
         )]
     );
@@ -198,7 +199,7 @@ fn tables_carry_alignment() {
 
 #[test]
 fn the_indent_invariant_holds_for_awkward_nesting() {
-    // `> - a` flattens; whatever it flattens to must still satisfy the
+    // Whatever a nested container flattens to must still satisfy the
     // invariant the serializer relies on.
     for source in [
         "> - a",

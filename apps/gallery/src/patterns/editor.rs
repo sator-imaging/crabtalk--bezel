@@ -7,9 +7,10 @@
 //! Three things it is built to show.
 //!
 //! **The output is the document, live.** The right pane is
-//! `editor.source()` — the document normalized and written back to markdown on
-//! every keystroke. Nothing is transformed on the way to the screen, so what
-//! you read there is exactly what a save would write.
+//! `editor.source()` — the document as markdown on every keystroke, each block
+//! edited written back normalized and the rest as it was read. Nothing is
+//! transformed on the way to the screen, so what you read there is exactly
+//! what a save would write.
 //!
 //! **The toolbar is a caller, not a component.** It floats at
 //! `Editor::selection_bounds()` and each button is `toggle_mark` — the same
@@ -48,7 +49,7 @@ Select any of this and the toolbar appears. **Bold**, _italic_ and `code` are on
 - Paste a URL on an empty line for a card, or into a sentence for a chip
 - Hover a block and drag its handle to reorder it
 - Everything on the right is what a save would write
-- Click into the chart at the bottom to see the fence it really is
+- Click into the chart or the diagram at the bottom to see the fence it really is
 
 ![A caption is the alt text, and a caret can sit in it](https://crabtalk.ai/og-home.png)
 
@@ -65,6 +66,13 @@ A fence the app knows how to paint is a block of its own — put the caret in it
 parse: 12
 render: 47
 paint: 31
+```
+
+```mermaid
+flowchart LR
+  source[Markdown] --> parse --> doc[Document]
+  doc --> paint --> window[Window]
+  doc --> serialize --> source
 ```
 "#;
 
@@ -146,18 +154,20 @@ impl EditorDemo {
             body: format!("Note {}", self.threads.len() + 1).into(),
         });
         self.open = Some(id);
-        self.editor.update(cx, |editor, cx| {
-            let mut anchors = editor.anchors().to_vec();
+        let document = self.editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            let mut anchors = document.anchors().to_vec();
             anchors.push(Anchor::new(id, selection));
-            editor.set_anchors(anchors, cx);
+            document.set_anchors(anchors, cx);
         });
     }
 
     /// Repaint the anchors so the open thread is the lit one.
     fn light(&self, cx: &mut Context<Self>) {
         let open = self.open;
-        self.editor.update(cx, |editor, cx| {
-            let anchors = editor
+        let document = self.editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            let anchors = document
                 .anchors()
                 .iter()
                 .map(|anchor| Anchor {
@@ -169,7 +179,7 @@ impl EditorDemo {
                     ..anchor.clone()
                 })
                 .collect();
-            editor.set_anchors(anchors, cx);
+            document.set_anchors(anchors, cx);
         });
     }
 
@@ -295,7 +305,7 @@ impl EditorDemo {
                         .w(px(1.0))
                         .h(px(16.0))
                         .mx(px(3.0))
-                        .bg(theme.hairline(0.14)),
+                        .bg(theme.border_strong),
                 )
                 .child(comment)
                 .into_any_element(),
@@ -397,7 +407,7 @@ impl Render for EditorDemo {
                     .flex_row()
                     .gap(px(24.0))
                     .child(document)
-                    .child(div().flex_none().w(px(1.0)).bg(theme.hairline(0.10)))
+                    .child(div().flex_none().w(px(1.0)).bg(theme.border))
                     .child(
                         div()
                             .flex_1()

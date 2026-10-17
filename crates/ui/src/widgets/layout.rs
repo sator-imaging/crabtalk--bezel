@@ -5,7 +5,7 @@
 //! `theme.collapsible_header(..)`, `theme.split_handle(..)`, `theme.tab(..)`.
 
 use crate::stack;
-use gpui::{Div, SharedString, Svg, div, prelude::*, px};
+use gpui::{CursorStyle, Div, SharedString, Svg, div, prelude::*, px};
 use icons::Icon;
 use motion::{self, Fade};
 use theme::{TextStyle, Theme, ThemeExt, Typeset};
@@ -18,6 +18,9 @@ pub struct SplitDrag;
 /// Width of the divider's grab strip: the 1px line plus zed's own 4px of slack
 /// each side (`workspace::HANDLE_HITBOX_SIZE`) — a 1px target is unhittable.
 pub const SPLIT_HANDLE_HIT: f32 = 9.0;
+/// The bar a [`Layout::grip_handle`] holds, along the edge and across it.
+const GRIP_LENGTH: f32 = 36.0;
+const GRIP_THICKNESS: f32 = 4.0;
 
 /// What a [`Layout::split_handle`] paints. `Ghost` is for a pane that already
 /// draws the edge itself; the strip still takes the drag.
@@ -100,9 +103,9 @@ pub trait Layout: ThemeExt {
         // `popover::menu_row`'s and `tree::tree_row`'s, so a sidebar, a menu
         // and a tree never show three different ideas of "this one".
         let tint = if selected {
-            theme.text
+            theme.row_text(true, false)
         } else {
-            motion::hover_blend(&fade, theme.text_muted, theme.text)
+            motion::hover_blend(&fade, theme.row_text(false, false), theme.text)
         };
         let mut row = stack::row()
             .w_full()
@@ -133,6 +136,16 @@ pub trait Layout: ThemeExt {
             )
         })
         .child(div().min_w_0().flex_1().truncate().child(label.into()))
+    }
+
+    /// A vertical rule between clusters of controls in a bar.
+    fn toolbar_separator(&self) -> Div {
+        div()
+            .w(px(1.0))
+            .h(px(16.0))
+            .mx(px(2.0))
+            .flex_none()
+            .bg(self.theme().border)
     }
 
     /// The divider between two panes: a hairline centred in a grab strip, lit
@@ -182,6 +195,28 @@ pub trait Layout: ThemeExt {
                     el.child(div().h(px(1.0)).w_full().bg(line))
                 }),
         }
+    }
+
+    /// The grip along an edge that a box is dragged taller or shorter by: a
+    /// [`Self::split_handle`]'s strip across the edge, holding a short bar in
+    /// its middle that says the edge can be pulled.
+    fn grip_handle(&self) -> Div {
+        let theme = self.theme();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(SPLIT_HANDLE_HIT))
+            .w_full()
+            .cursor(CursorStyle::ResizeUpDown)
+            .child(
+                div()
+                    .w(px(GRIP_LENGTH))
+                    .h(px(GRIP_THICKNESS))
+                    .rounded_full()
+                    .bg(theme.border_strong),
+            )
     }
 
     /// Tab strip: a hairline-underlined row that tabs sit on.

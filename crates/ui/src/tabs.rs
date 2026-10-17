@@ -42,9 +42,12 @@ use theme::{TextStyle, Theme, Typeset};
 
 use crate::widgets::{self, Buttons as _};
 
+mod bar;
 mod reorder;
 
-pub use reorder::Reorder;
+pub use bar::TabBar;
+
+pub use reorder::{Bar, Move, OutsideDrop, Reorder};
 
 /// An ordered set of tabs, one of them active.
 ///
@@ -143,11 +146,11 @@ impl<Id: Clone + PartialEq> Strip<Id> {
         true
     }
 
-    /// Step the front `step` tabs along, wrapping at both ends. An empty strip
-    /// does not move.
-    pub fn cycle(&mut self, step: isize) {
+    /// Step the front `step` tabs along, wrapping at both ends. Whether the
+    /// front changed: an empty strip, a lone tab and a whole lap do not move.
+    pub fn cycle(&mut self, step: isize) -> bool {
         if self.order.is_empty() {
-            return;
+            return false;
         }
         let len = self.order.len() as isize;
         let at = self
@@ -155,10 +158,15 @@ impl<Id: Clone + PartialEq> Strip<Id> {
             .as_ref()
             .and_then(|id| self.index_of(id))
             .unwrap_or(0) as isize;
-        self.active = self
+        let next = self
             .order
             .get((at + step).rem_euclid(len) as usize)
             .cloned();
+        if next == self.active {
+            return false;
+        }
+        self.active = next;
+        true
     }
 
     /// Move the tab at `from` so that it sits at `to`. Out-of-range ends are
@@ -332,15 +340,8 @@ const TAB_PAD: f32 = 8.0;
 /// It scrolls sideways once the tabs no longer fit. `min_w_0` is what allows
 /// that — a flex child's `min-width: auto` refuses to shrink below its content,
 /// so without it the strip grows past its row instead of scrolling.
-pub fn bar(id: impl Into<ElementId>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .min_w_0()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(GAP))
-        .overflow_x_scroll()
+pub fn bar(id: impl Into<ElementId>) -> TabBar {
+    TabBar::new(id.into())
 }
 
 /// One tab, up to the `×`: pass the same `key` to [`close`] and chain the
@@ -387,7 +388,10 @@ pub fn tab(
         .text_style(TextStyle::Callout)
         .text_color(tint)
         .cursor_pointer()
-        .when(state == State::Focused, |el| el.bg(theme.element_active))
+        .when(state == State::Focused, |el| {
+            el.bg(theme.card_selected_bg())
+                .shadow(theme::glass_selected_shadows())
+        })
         .when(state != State::Focused, |el| {
             el.hover(move |el| el.bg(wash))
         })
@@ -423,6 +427,7 @@ pub fn close(theme: &Theme, key: impl Into<SharedString>, when: Close) -> Statef
             "tab-close-{key}"
         ))))
         .flex_none()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .p(px(2.0))
         .child(
             crate::icons::icon(crate::icons::glyph::X)

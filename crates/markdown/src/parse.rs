@@ -5,17 +5,12 @@
 //! - a list item's first paragraph becomes its marker block (bullet, ordered,
 //!   task) at one level shallower than the open list count, and anything else
 //!   in that item becomes a child at the list count itself;
-//! - a blockquote's paragraphs each become a [`BlockKind::Quote`], every one
-//!   of them carrying the GFM alert kind the blockquote opened with. Being
-//!   inside a quote decides a block's *kind*, never its depth — an indent a
-//!   blockquote contributed could not be reproduced in the output, and the
-//!   document would move every time it was read;
 //! - everything else keeps its kind at the open list count.
 //!
-//! Mixed containers therefore flatten: `> - a` yields a bullet and loses the
-//! quote. That is the cost of the flat model, and the fixed-point test in
-//! [`crate::serialize`] is what keeps it from mattering — whatever the first
-//! parse decides is stable from then on.
+//! A block inside a blockquote carries a [`Block::quote`] with the GFM alert
+//! the blockquote opened with. A blockquote never adds to the indent.
+//! Blockquotes nested in one another flatten to one, and the fixed-point test
+//! in [`crate::serialize`] keeps whatever the first parse decides.
 //!
 //! The parse also normalizes what markdown itself would not preserve: leading
 //! and trailing whitespace per line, blank lines at a block's edges, headings
@@ -29,7 +24,7 @@ use pulldown_cmark::{
 use std::ops::Range;
 
 use crate::{
-    doc::{Align, Block, BlockKind, Doc, Form, Mark, MarkSpan, QuoteKind, Text},
+    doc::{Align, Block, BlockKind, Doc, Form, Mark, MarkSpan, QuoteKind, Quoted, Text},
     marks::Marks,
     select::Cursor,
 };
@@ -41,6 +36,19 @@ mod state;
 pub use inline::*;
 pub use lift::*;
 use state::*;
+
+/// A word and a size after it, as a fence's info string and a link's title
+/// spell them: `mermaid 360`, `embed 360`. A last word that is not a positive
+/// whole number is part of the first.
+pub(crate) fn split_size(spelled: &str) -> (&str, Option<u32>) {
+    let Some((name, tail)) = spelled.rsplit_once(char::is_whitespace) else {
+        return (spelled, None);
+    };
+    match tail.parse().ok().filter(|size| *size > 0) {
+        Some(size) => (name.trim_end(), Some(size)),
+        None => (spelled, None),
+    }
+}
 
 /// The extensions this crate reads. [`crate::source`] colours with the same set.
 pub(crate) const OPTIONS: Options = Options::ENABLE_TABLES
@@ -82,7 +90,22 @@ pub struct ParsedDoc {
 
 /// [`parse`], keeping the source range each block was parsed from.
 pub fn parse_ranges(source: &str) -> ParsedDoc {
-    let (doc, starts) = parse_spanned(source);
+    parse_ranges_with(source, &Marks::default())
+}
+
+/// [`parse_ranges`] with the app's own marks — see [`parse_with`].
+pub fn parse_ranges_with(source: &str, marks: &Marks) -> ParsedDoc {
+    if marks.is_empty() {
+        let (doc, starts) = parse_spanned(source);
+        return ParsedDoc {
+            block_ranges: ranges(&starts, source.len()),
+            doc,
+        };
+    }
+    let (lifted, aligned) = lift(source, marks);
+    let (mut doc, starts) = parse_spanned(&lifted);
+    settle_all(&mut doc, marks);
+    let starts: Vec<usize> = starts.iter().map(|&at| unlift(&aligned, at)).collect();
     ParsedDoc {
         block_ranges: ranges(&starts, source.len()),
         doc,
@@ -138,7 +161,13 @@ pub fn parse_with(source: &str, marks: &Marks) -> Doc {
     if marks.is_empty() {
         return parse_plain(source);
     }
-    let mut doc = parse_plain(&lift(source, marks));
+    let mut doc = parse_plain(&lift(source, marks).0);
+    settle_all(&mut doc, marks);
+    doc
+}
+
+/// Turn every lifted mark in `doc` back into the mark it stands for.
+fn settle_all(doc: &mut Doc, marks: &Marks) {
     for block in &mut doc.blocks {
         for part in block.parts() {
             if let Some(text) = block.text_at_mut(part) {
@@ -146,7 +175,6 @@ pub fn parse_with(source: &str, marks: &Marks) -> Doc {
             }
         }
     }
-    doc
 }
 
 fn parse_plain(source: &str) -> Doc {

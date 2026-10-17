@@ -1,4 +1,4 @@
-//! `reference.swift` in bezel: one 168x168 r34 glass square over the frosted
+//! `reference.swift` in bezel: one 168x168 r34 glass square over the translucent
 //! window background, with text under it to refract. The Swift probe holds a
 //! real `NSGlassEffectView`, this holds ours, and the two are the same scene at
 //! the same measurements — so a difference on screen is our lens and nothing
@@ -15,7 +15,8 @@ use gpui::{
 };
 use motion::Painter;
 use theme::{
-    Appearance, Glass, SurfaceSpec, SurfaceStyle, TextStyle, Theme, Typeset as _, Vibrancy,
+    AppExt as _, Appearance, Glass, SurfaceSpec, SurfaceStyle, TextStyle, Theme, Typeset as _,
+    Vibrancy,
     appearance::{self, AppearanceMode},
 };
 use ui::{
@@ -103,9 +104,9 @@ fn main() {
             cx,
         );
         if opaque {
-            let mut brand = theme::brand(cx);
+            let mut brand = cx.brand();
             brand.vibrancy = Vibrancy::Off;
-            theme::set_brand(brand, cx);
+            cx.set_brand(brand);
         }
         focus::init(cx);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
@@ -258,13 +259,13 @@ impl Parity {
     /// The window mode alone: the frost's coverage and the chrome's glass both
     /// stay where they are, so the card is the one thing that has not changed
     /// between the two shots.
-    fn set_frosted(on: bool, cx: &mut App) {
-        let mut brand = theme::brand(cx);
+    fn set_translucent(on: bool, cx: &mut App) {
+        let mut brand = cx.brand();
         brand.vibrancy = match on {
             true => Vibrancy::On,
             false => Vibrancy::Off,
         };
-        theme::set_brand(brand, cx);
+        cx.set_brand(brand);
     }
 }
 
@@ -272,7 +273,7 @@ impl Render for Parity {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let dark = matches!(theme.appearance, Appearance::Dark);
-        let frosted = theme.vibrancy;
+        let translucent = theme.vibrancy;
         // The card is painted from `spec` whichever chip named it, so the knobs
         // have one conduit into the lens.
         let tuned = Theme {
@@ -444,11 +445,11 @@ impl Render for Parity {
                                 )))
                                 .child(div().w(px(12.0)))
                                 .child(pick("dark", dark).on_click(cx.listener(|_, _, _, cx| {
-                                    appearance::set_mode(AppearanceMode::Dark, cx);
+                                    cx.set_appearance_mode(AppearanceMode::Dark);
                                     cx.notify();
                                 })))
                                 .child(pick("light", !dark).on_click(cx.listener(|_, _, _, cx| {
-                                    appearance::set_mode(AppearanceMode::Light, cx);
+                                    cx.set_appearance_mode(AppearanceMode::Light);
                                     cx.notify();
                                 })))
                                 .child(div().w(px(12.0)))
@@ -469,15 +470,15 @@ impl Render for Parity {
                                 .flex()
                                 .flex_row()
                                 .gap(px(8.0))
-                                .child(pick("frosted", frosted).on_click(cx.listener(
+                                .child(pick("translucent", translucent).on_click(cx.listener(
                                     |_, _, _, cx| {
-                                        Self::set_frosted(true, cx);
+                                        Self::set_translucent(true, cx);
                                         cx.notify();
                                     },
                                 )))
-                                .child(pick("opaque", !frosted).on_click(cx.listener(
+                                .child(pick("opaque", !translucent).on_click(cx.listener(
                                     |_, _, _, cx| {
-                                        Self::set_frosted(false, cx);
+                                        Self::set_translucent(false, cx);
                                         cx.notify();
                                     },
                                 )))

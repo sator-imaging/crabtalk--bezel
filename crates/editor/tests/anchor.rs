@@ -6,7 +6,7 @@
 //! path through `Editor::edit` reports what it did, and a path that forgets is
 //! invisible to a unit test of the arithmetic.
 
-use editor::{Anchor, AnchorId, Editor};
+use editor::{Anchor, AnchorId, Editor, SourceAnchor};
 use gpui::{Entity, Focusable, TestAppContext, VisualTestContext, px, size};
 use markdown::{Cursor, Part, Selection};
 
@@ -25,11 +25,15 @@ const PRIMARY: &str = "cmd";
 const PRIMARY: &str = "ctrl";
 
 fn open(cx: &mut TestAppContext) -> (Entity<Editor>, VisualTestContext) {
+    open_with(SOURCE, cx)
+}
+
+fn open_with(source: &str, cx: &mut TestAppContext) -> (Entity<Editor>, VisualTestContext) {
     cx.update(|cx| {
         theme::Theme::install(theme::Appearance::Dark, cx);
         editor::init(cx);
     });
-    let window = cx.add_window(|_, cx| Editor::new(SOURCE, cx));
+    let window = cx.add_window(|_, cx| Editor::new(source, cx));
     let editor = window.root(cx).unwrap();
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(size(px(360.0), px(600.0)));
@@ -54,17 +58,18 @@ fn anchor(
 ) {
     let (block, from, to) = range;
     cx.update(|_, cx| {
-        editor.update(cx, |editor, cx| {
-            editor.set_anchors(
+        let document = editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            document.set_anchors(
                 vec![Anchor::new(
                     ID,
                     Selection::new(at(block, from), at(block, to)),
                 )],
                 cx,
-            );
-            editor.select(Selection::at(caret), cx);
-        })
+            )
+        });
     });
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.select(Selection::at(caret), cx)));
 }
 
 /// The anchored range, as `(block, start, end)`.
@@ -285,4 +290,177 @@ fn an_inline_rule_takes_its_delimiters_off_the_anchor(cx: &mut TestAppContext) {
         (0, 7, 10),
         "one bold letter is what is left ahead of the word"
     );
+}
+
+/// The words an anchor points at, read out of whichever form is shown.
+fn anchored_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        let (start, end) = editor.anchors()[0].range.ordered();
+        let text = editor.doc().blocks[start.block]
+            .text_at(start.part)
+            .unwrap();
+        text.text[start.offset..end.offset].to_string()
+    })
+}
+
+fn toggle_source(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn an_anchor_follows_the_source_and_comes_back(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(cx);
+    // "two" in `bravo two`.
+    anchor(&editor, &mut cx, (1, 6, 9), at(0, 0));
+    toggle_source(&editor, &mut cx);
+    assert_eq!(
+        anchored_text(&editor, &mut cx),
+        "two",
+        "the same words in the source"
+    );
+
+    // The caret crossed at the very start.
+    cx.simulate_input("XX");
+    assert_eq!(
+        anchored_text(&editor, &mut cx),
+        "two",
+        "a source edit carries it along"
+    );
+
+    toggle_source(&editor, &mut cx);
+    assert_eq!(anchored(&editor, &mut cx), (1, 6, 9));
+    assert_eq!(
+        anchored_text(&editor, &mut cx),
+        "two",
+        "and back onto the blocks"
+    );
+}
+
+#[gpui::test]
+fn an_anchor_end_in_the_markup_comes_back_detached(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open_with("# Title", cx);
+    toggle_source(&editor, &mut cx);
+    // Between `#` and its space: no block owns that position.
+    let code = |offset| Cursor::new(0, Part::Code, offset);
+    cx.update(|_, cx| {
+        let document = editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            document.set_anchors(vec![Anchor::new(ID, Selection::new(code(1), code(7)))], cx)
+        })
+    });
+    toggle_source(&editor, &mut cx);
+    assert!(
+        detached(&editor, &mut cx),
+        "not stretched from the document start"
+    );
+}
+
+#[gpui::test]
+fn anchors_cross_to_and_from_the_markdown(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(cx);
+    let bravo = SOURCE.find("bravo").unwrap();
+    cx.update(|_, cx| {
+        let document = editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            document.set_source_anchors(
+                SOURCE,
+                vec![SourceAnchor {
+                    id: ID,
+                    range: bravo..bravo + 5,
+                    state: markdown::Annotation::Open,
+                    actionable: true,
+                }],
+                cx,
+            )
+        })
+    });
+    assert_eq!(anchored(&editor, &mut cx), (1, 0, 5));
+    let actionable = cx.update(|_, cx| editor.read(cx).anchors()[0].actionable);
+    assert!(actionable, "the flag comes through with the range");
+    let (source, ranges) =
+        cx.update(|_, cx| editor.read(cx).document().read(cx).source_with_anchors());
+    assert_eq!(source, SOURCE);
+    assert_eq!(ranges, vec![(ID, Some(bravo..bravo + 5))]);
+}
+
+#[gpui::test]
+fn anchor_tops_follow_the_document_down(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(cx);
+    let (alpha, charlie) = (
+        SOURCE.find("alpha").unwrap(),
+        SOURCE.find("charlie").unwrap(),
+    );
+    cx.update(|_, cx| {
+        let document = editor.read(cx).document().clone();
+        document.update(cx, |document, cx| {
+            document.set_source_anchors(
+                SOURCE,
+                vec![
+                    SourceAnchor {
+                        id: AnchorId(2),
+                        range: charlie..charlie + 7,
+                        state: markdown::Annotation::Open,
+                        actionable: false,
+                    },
+                    SourceAnchor {
+                        id: ID,
+                        range: alpha..alpha + 5,
+                        state: markdown::Annotation::Open,
+                        actionable: false,
+                    },
+                ],
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let tops = cx.update(|_, cx| editor.read(cx).anchor_tops());
+    let ids: Vec<_> = tops.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![ID, AnchorId(2)], "in document order");
+    assert!(tops[0].1 < tops[1].1, "{tops:?}");
+}
+
+#[gpui::test]
+fn washes_leave_the_anchors_alone(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(cx);
+    let hit = Selection::new(at(0, 0), at(0, 5));
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_washes(vec![(hit, markdown::Annotation::Match)], cx)
+        })
+    });
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).anchors().is_empty());
+        assert_eq!(
+            editor.read(cx).washes(),
+            &[(hit, markdown::Annotation::Match)]
+        );
+    });
+}
+
+#[gpui::test]
+fn the_pointer_over_anchored_text_names_the_anchor(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(cx);
+    anchor(&editor, &mut cx, ONE, at(0, 0));
+    let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let heard = heard.clone();
+        cx.subscribe(&editor, move |_, event: &editor::EditorEvent, _| {
+            if let editor::EditorEvent::AnchorHovered(over) = event {
+                heard.borrow_mut().push(*over);
+            }
+        })
+        .detach();
+    });
+    let bounds = cx
+        .update(|_, cx| editor.read(cx).anchor_bounds(ID))
+        .expect("the anchor painted somewhere");
+    let on = bounds.origin + gpui::point(px(2.0), bounds.size.height / 2.0);
+    cx.simulate_mouse_move(on, None, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(heard.borrow().as_slice(), &[Some(ID)]);
 }

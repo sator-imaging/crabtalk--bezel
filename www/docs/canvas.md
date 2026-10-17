@@ -40,13 +40,13 @@ fn session(store: Store) -> Kind {
 Kinds::new().with("session", session(store)).with_fresh(|| new_session());  // what the canvas makes from nothing
 ```
 
-A kind is keyed by the node's `type`, and holds what it needs. Kinds belong to a view (`with_kinds`); `canvas::set_kinds(cx, kinds)` names them for every view that names none. A kind's `rules` — sizing, edit field, child, holds — are what the editor reads without a window. The canvas owns the node's box — position, size, the selection ring, the handles, dragging and resizing — and the kind paints everything inside it; `kind::chrome` dresses a box as the spec's kinds do. The spec's four — `kind::text()`, `file()`, `link()`, `group()` — are replaceable the same way. `Kinds::with_root(dir)` finds files and group backgrounds under `dir`, so images preview. A link opens on a double-click. `with_fresh` names the node made from nothing — a double-click on empty canvas, `tab` on an empty one, pasted text, written through its kind's edit field — a blank text node unless an app says.
+A kind is keyed by the node's `type`, and holds what it needs. Kinds belong to a view (`with_kinds`); `cx.set_canvas_kinds(kinds)` names them for every view that names none. A kind's `rules` — sizing, edit field, child, holds — are what the editor reads without a window. The canvas owns the node's box — position, size, the selection ring, the handles, dragging and resizing — and the kind paints everything inside it; `kind::chrome` dresses a box as the spec's kinds do. The spec's four — `kind::text()`, `file()`, `link()`, `group()` — are replaceable the same way. `Kinds::with_root(dir)` finds files and group backgrounds under `dir`, so images preview. A link opens on a double-click. `with_fresh` names the node made from nothing — a double-click on empty canvas, `tab` on an empty one, pasted text, written through its kind's edit field — a blank text node unless an app says.
 
 ## Containers
 
 Any node holds others. A node names its container in `"container"` (`contain::hold`); one that names none sits in the smallest node around it whose kind `holds`, as a group does. What a node holds, however deep, moves, copies and duplicates with it and paints above it; removing a container leaves what it held. A node carried out of the container it names lets it go, and a kind that holds is never a drop target.
 
-State stays with the app: look the view up by the node's id. gpui cannot transform an element, so `zoom` is a scale the content applies itself — `canvas::text_style(div(), TextStyle::Callout, zoom)` sets size, leading and weight together, and `Typography::scaled` does a whole document. A node of fixed size clips what it paints.
+State stays with the app: look the view up by the node's id. gpui cannot transform an element, so `zoom` is a scale the content applies itself — `div().text_style_at(TextStyle::Callout, zoom)` (`theme::Typeset`) sets size, leading and weight together, and `Typography::scaled` does a whole document. A node of fixed size clips what it paints.
 
 ## Changes
 
