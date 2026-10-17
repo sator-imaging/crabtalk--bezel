@@ -6,19 +6,22 @@
 //! composed exactly once, so the browser is never out of date with the library
 //! it documents.
 
+use editor::AppExt as _;
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Empty, Entity, KeyBinding, SharedString, Window,
     actions, div, point, prelude::*, px, relative,
 };
+use markdown::AppExt as _;
 use motion::{AppExt as _, Fade, Painter};
 use rail::{Rail, Selected};
 use std::{cell::Cell, collections::HashSet, rc::Rc};
 use theme::{
     ControlSize, Glass, Material, Sizing, SurfaceSpec, SurfaceStyle, TextStyle, Theme, Typeset,
-    appearance::{self, AppearanceMode},
+    appearance::AppearanceMode,
 };
 use ui::{
     combobox::{self, Combobox},
+    context_menu::{ContextMenu, Place},
     control_bar::{self, Shape as ControlBarShape},
     date::{self, Calendar, Date},
     floating::{self, Floating},
@@ -29,6 +32,7 @@ use ui::{
     keys, list, loaders,
     menu::Item,
     menubar::{self, Menu, Menubar, MenubarEvent},
+    multi_select::{self, MultiSelect, MultiSelectEvent},
     pagination,
     palette::{self, CommandPalette, PaletteEvent},
     pending::PendingKeys,
@@ -70,24 +74,27 @@ const APP_MENUBAR: bool = !cfg!(any(target_os = "macos", target_family = "wasm")
 /// bindings were installed natively and missing on the web, so typing worked in
 /// the browser and Backspace did not.
 pub fn init(cx: &mut App) {
-    markdown::set_highlighter(cx, highlight::spans, highlight::languages());
-    markdown::set_link_preview(cx, preview::of);
-    markdown::set_block_renderer(cx, blocks::render);
+    cx.set_highlighter(highlight::spans, highlight::languages());
+    cx.set_links::<preview::Links>();
+    cx.set_block_renderer(|fence, window, cx| {
+        blocks::render(fence.language, fence.code, fence.height, window, cx)
+    });
     // The dialect this gallery reads and writes: two marks CommonMark has no
     // spelling for, registered rather than waited on. See the Ribbon page.
-    markdown::set_marks(
-        cx,
+    cx.set_marks(
         markdown::Marks::new()
             .with("highlight", "==")
             .with("underline", "++"),
     );
-    markdown::set_mark_paint(cx, patterns::ribbon::paint);
-    editor::set_image_store(cx, store::of());
+    cx.set_mark_paint(patterns::ribbon::paint);
+    cx.set_image_store(store::of());
     input::init(cx);
     editor::init(cx);
     canvas::init(cx);
     palette::init(cx);
     combobox::init(cx);
+    multi_select::init(cx);
+    ui::menu::init(cx);
     date::init(cx);
     focus::init(cx);
     menubar::init(cx);
@@ -124,8 +131,7 @@ mod sections;
 
 pub use catalog::*;
 pub use fixtures::*;
-use sections::*;
-use sections::{controls, data, foundations, material, navigation, overlays};
+use sections::{controls, data, foundations, material, navigation, overlays, *};
 
 /// The rail's padding — the grid its rows, its footer and the traffic lights
 /// all sit on.
@@ -182,14 +188,24 @@ const COMPACT_NAV_PAD: f32 = if cfg!(target_os = "macos") {
     RAIL_PAD
 };
 
+/// Which of the context menu page's menus is up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Demo {
+    /// At a right press anywhere in the window.
+    Pointer,
+    /// Under the page's `···`.
+    Button,
+}
+
 pub struct Gallery {
     /// Mounted only while open — a palette that lingers keeps a stale query.
     palette: Option<Entity<CommandPalette>>,
     last_command: Option<SharedString>,
     /// Built on the first render, which is the first time there is a window.
     pending: Option<Entity<PendingKeys>>,
-    /// Right-click menu, anchored at the click position.
-    context_menu: popover::Popup<gpui::Point<gpui::Pixels>>,
+    /// The context menu page's two menus: one at a right press anywhere,
+    /// one under its `···`.
+    context_menu: ContextMenu<Self, Demo>,
     /// The menubar demo, which holds which menu is down.
     menubar: Entity<Menubar>,
     /// The app's own menus, mounted in the nav where the platform has no menu
@@ -308,7 +324,7 @@ impl Gallery {
             palette: None,
             last_command: None,
             pending: None,
-            context_menu: popover::Popup::default(),
+            context_menu: ContextMenu::default(),
             sheet: popover::Popup::default(),
             drawer: popover::Popup::default(),
             focus_handle: cx.focus_handle(),
@@ -479,10 +495,7 @@ impl Gallery {
     }
 
     fn close_context_menu(&mut self, cx: &mut Context<Self>) {
-        if self.context_menu.begin_close() {
-            popover::reap_popup(self, cx, |view: &mut Self| &mut view.context_menu);
-        }
-        cx.notify();
+        ContextMenu::close(self, |view| &mut view.context_menu, cx);
     }
 
     /// Straight off, because `popover::modal` has no exit to play — unlike the

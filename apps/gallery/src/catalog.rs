@@ -185,6 +185,7 @@ pub const PATTERNS: &[Group] = &[
             ),
             section("editor", "Editor", "apps/gallery/src/patterns/editor.rs"),
             section("canvas", "Canvas", "apps/gallery/src/patterns/canvas.rs"),
+            section("charts", "Charts", "apps/gallery/src/patterns/charts.rs"),
             section("browser", "Browser", "apps/gallery/src/patterns/browser.rs"),
             section("ribbon", "Ribbon", "apps/gallery/src/patterns/ribbon.rs"),
             section(
@@ -257,6 +258,11 @@ pub const COMPONENTS: &[Group] = &[
             section("select", "Select", "crates/ui/src/widgets/controls.rs"),
             section("combobox", "Combobox", "crates/ui/src/combobox.rs"),
             section(
+                "multi-select",
+                "Multi-select",
+                "crates/ui/src/multi_select.rs",
+            ),
+            section(
                 "checkbox-radio",
                 "Checkbox & radio",
                 "crates/ui/src/widgets/controls.rs",
@@ -268,6 +274,7 @@ pub const COMPONENTS: &[Group] = &[
                 "crates/ui/src/widgets/controls.rs",
             ),
             section("slider", "Slider", "crates/ui/src/widgets/controls.rs"),
+            section("color-picker", "Color picker", "crates/ui/src/color.rs"),
             section("date-picker", "Date picker", "crates/ui/src/date.rs"),
         ],
     },
@@ -275,7 +282,11 @@ pub const COMPONENTS: &[Group] = &[
         title: "Menus & actions",
         sections: &[
             section("menu", "Menu", "crates/ui/src/popover.rs"),
-            section("context-menu", "Context menu", "crates/ui/src/popover.rs"),
+            section(
+                "context-menu",
+                "Context menu",
+                "crates/ui/src/context_menu.rs",
+            ),
             section("palette", "Command palette", "crates/ui/src/palette.rs"),
             section("menubar", "Menubar", "crates/ui/src/menubar.rs"),
         ],
@@ -299,6 +310,8 @@ pub const COMPONENTS: &[Group] = &[
             ),
             section("tabs", "Tabs", "crates/ui/src/widgets/layout.rs"),
             section("tab-strip", "Tab strip", "crates/ui/src/tabs.rs"),
+            section("docking", "Pane docking", "crates/ui/src/docking.rs"),
+            section("sortable", "Sortable lists", "crates/ui/src/drag.rs"),
             section("nav-row", "Nav row", "crates/ui/src/widgets/layout.rs"),
             section(
                 "collapsible",

@@ -29,7 +29,14 @@ use gpui::{
 };
 use icons::Icon;
 use motion::{self as motion, AnimationExt as _, Fade, PULSE, Painter};
-use theme::{TextStyle, Theme, Typeset, hairline, ink};
+use theme::{TextStyle, Theme, Typeset, ink};
+
+/// The deferred priority a modal and a sheet paint at.
+const MODAL_LAYER: usize = 2;
+
+/// The deferred priority a menu and its submenus paint at: over a modal, so a
+/// menu opened inside one shows.
+const MENU_LAYER: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
@@ -389,6 +396,10 @@ pub(crate) const MENU_PAD: f32 = 4.0;
 /// room and is snapped back inside it.
 pub(crate) const SNAP: f32 = 8.0;
 
+/// How far a [`menu_row`]'s text sits in from its own edge. Content that is
+/// not a row lines up with the rows' text by insetting this much.
+pub const MENU_ROW_INSET: f32 = 8.0;
+
 /// A [`menu_row`]'s padding above and below its line box. Named because a
 /// list that caps itself at a row count has to know how tall a row is.
 pub(crate) const MENU_ROW_PAD_Y: f32 = 6.0;
@@ -414,7 +425,7 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
     } else {
         card.bg(theme.surface_overlay)
             .border_1()
-            .border_color(hairline(0.10))
+            .border_color(theme.border)
             .shadow_lg()
     }
 }

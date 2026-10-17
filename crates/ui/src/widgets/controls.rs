@@ -1,17 +1,18 @@
-//! Display-only controls — toggle, checkbox, radio, progress, slider, select
-//! face, segmented control. State is always the caller's; each control is the
-//! paint plus its gesture contract, and the caller adds `.id(..)` / handlers —
-//! but for [`Controls::segmented`], which takes them.
+//! Display-only controls — toggle, checkbox, radio, progress, slider, color
+//! well, select face, segmented control. State is always the caller's; each
+//! control is the paint plus its gesture contract, and the caller adds
+//! `.id(..)` / handlers — but for [`Controls::segmented`], which takes them.
 //!
 //! A catalog trait, like every widget group: import it to unlock
 //! `theme.toggle(..)`, `theme.slider(..)`, `theme.toggle_group()`,
-//! `theme.segmented(..)`.
+//! `theme.segmented(..)`, `theme.picture_picker(..)`.
 
 use crate::stack;
 use std::rc::Rc;
 
 use gpui::{
-    App, Axis, Div, DragMoveEvent, ElementId, SharedString, Stateful, Window, div, prelude::*, px,
+    AnyElement, App, Axis, BoxShadow, Div, DragMoveEvent, ElementId, SharedString, Stateful,
+    Window, div, point, prelude::*, px,
 };
 use icons::Icon;
 use theme::{TextStyle, Theme, ThemeExt, Typeset};
@@ -108,7 +109,7 @@ pub trait Controls: ThemeExt {
             .rounded_full()
             .border_1()
             .border_color(if selected {
-                theme.text
+                theme.ring
             } else {
                 theme.ink(0.25)
             })
@@ -200,6 +201,54 @@ pub trait Controls: ThemeExt {
             )
     }
 
+    /// Display-only color well: a 20px ring holding `color`. The caller adds
+    /// `.id(..)` and `.on_click(..)`.
+    fn color_well(&self, color: gpui::Hsla) -> Div {
+        well(self.theme().ink(0.25), color)
+    }
+
+    /// Preset colors, wired: a click on one reports its index to `on_pick`.
+    /// The ring marks `selected`; none is marked when it is out of range or
+    /// `None`. One row when `columns` is `None`; otherwise rows of `columns`.
+    ///
+    /// ```ignore
+    /// let swatches = cx.color_swatches();
+    /// theme.swatch_picker("tint", &swatches, self.tint, Some(6),
+    ///     cx.listener(|view, ix: &usize, _, cx| view.pick_tint(*ix, cx)))
+    /// ```
+    fn swatch_picker(
+        &self,
+        id: impl Into<ElementId>,
+        swatches: &[crate::color::Swatch],
+        selected: Option<usize>,
+        columns: Option<usize>,
+        on_pick: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let on_pick = Rc::new(on_pick);
+        let wells: Vec<_> = swatches
+            .iter()
+            .enumerate()
+            .map(|(ix, swatch)| {
+                let on_pick = on_pick.clone();
+                let ring = match selected == Some(ix) {
+                    true => theme.text,
+                    false => crate::widgets::RING_SLOT,
+                };
+                well(ring, swatch.resolve(theme))
+                    .id(ix)
+                    .on_click(move |_, window, cx| on_pick(&ix, window, cx))
+            })
+            .collect();
+        let width = columns.filter(|n| *n > 0).unwrap_or(wells.len().max(1));
+        let mut wells = wells.into_iter();
+        let rows = std::iter::from_fn(|| {
+            let row: Vec<_> = wells.by_ref().take(width).collect();
+            (!row.is_empty()).then(|| stack::row().gap(px(4.0)).children(row))
+        });
+        stack::column().id(id).gap(px(4.0)).children(rows)
+    }
+
     /// The face of a select: current value plus a chevron, shaped and toned like
     /// [`crate::input::TextField`] so a form of fields and selects reads as one
     /// system. One look, open or shut — the menu hanging under it is what says
@@ -211,6 +260,16 @@ pub trait Controls: ThemeExt {
     /// state and the selection. Wrapping that in a struct would buy an
     /// abstraction and cost the caller its control over both.
     fn select_trigger(&self, label: impl Into<SharedString>) -> Div {
+        self.select_trigger_with(None::<Div>, label)
+    }
+
+    /// [`Self::select_trigger`] with `leading` drawn before the label — a
+    /// swatch or a sample of the value.
+    fn select_trigger_with(
+        &self,
+        leading: Option<impl IntoElement>,
+        label: impl Into<SharedString>,
+    ) -> Div {
         let theme = self.theme();
         stack::row()
             .justify_between()
@@ -223,7 +282,13 @@ pub trait Controls: ThemeExt {
             .text_style(TextStyle::Body)
             .text_color(theme.text)
             .cursor_pointer()
-            .child(div().min_w_0().truncate().child(label.into()))
+            .child(
+                stack::row()
+                    .min_w_0()
+                    .gap(px(8.0))
+                    .children(leading.map(|leading| div().flex_none().child(leading)))
+                    .child(div().min_w_0().truncate().child(label.into())),
+            )
             .child(
                 crate::icons::icon(crate::icons::glyph::ChevronDown)
                     .size(px(14.0))
@@ -313,6 +378,93 @@ pub trait Controls: ThemeExt {
                     }),
             )
     }
+
+    /// A row of tiles, each a picture over its label — macOS's appearance
+    /// picker. The `selected` tile is ringed in [`Theme::accent`]; a click on
+    /// any reports its index to `on_pick`. Nothing is selected when `selected`
+    /// is out of range.
+    ///
+    /// Each picture is the caller's, at the size it draws itself; the tile
+    /// clips it to its rounded frame.
+    fn picture_picker(
+        &self,
+        id: impl Into<ElementId>,
+        tiles: impl IntoIterator<Item = (AnyElement, SharedString)>,
+        selected: usize,
+        on_pick: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let on_pick = Rc::new(on_pick);
+        let radius = px(Theme::panel_radius());
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .children(tiles.into_iter().enumerate().map(|(ix, (picture, label))| {
+                let on = ix == selected;
+                let on_pick = on_pick.clone();
+                let hover = theme.border_strong;
+                // The ring is a shadow, so choosing a tile moves nothing.
+                let ring = BoxShadow {
+                    color: theme.accent,
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(0.0),
+                    spread_radius: px(PICTURE_RING),
+                    inset: false,
+                };
+                div()
+                    .id(ix)
+                    .group("picture-tile")
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| on_pick(&ix, window, cx))
+                    .child(
+                        div()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .overflow_hidden()
+                            .when(on, |frame| frame.shadow(vec![ring]))
+                            .when(!on, |frame| {
+                                frame.group_hover("picture-tile", move |frame| {
+                                    frame.border_color(hover)
+                                })
+                            })
+                            .child(picture),
+                    )
+                    .child(
+                        div()
+                            .text_style(TextStyle::Callout)
+                            .text_color(match on {
+                                true => theme.text,
+                                false => theme.text_muted,
+                            })
+                            .when(on, |label| label.font_weight(gpui::FontWeight::MEDIUM))
+                            .child(label),
+                    )
+            }))
+    }
+}
+
+/// How far a [`Controls::picture_picker`] tile's selection ring stands
+/// outside its frame.
+const PICTURE_RING: f32 = 2.0;
+
+/// A 20px ring in `ring` around a disc of `color`.
+fn well(ring: gpui::Hsla, color: gpui::Hsla) -> Div {
+    div()
+        .flex_none()
+        .size(px(20.0))
+        .p(px(2.0))
+        .rounded_full()
+        .border_1()
+        .border_color(ring)
+        .cursor_pointer()
+        .child(div().size_full().rounded_full().bg(color))
 }
 
 /// What a segment looks like in each of its two states, before whatever it

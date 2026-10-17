@@ -6,19 +6,15 @@ use gpui::{Hsla, WindowBackgroundAppearance, hsla};
 use crate::{Appearance, color, paint, theme::Theme};
 
 impl Theme {
-    /// The frost tint painted over the blurred window background (macOS glass),
-    /// at [`Brand::vibrancy_alpha`](crate::Brand::vibrancy_alpha). Dark: darker than
-    /// `surface`, matched to the reference vibrancy scrim `hsl(0 0% 3%)`.
-    /// Light: the material's own measured tone. Opaque, this IS the surface tone.
+    /// The frost tint painted over the blurred window background (macOS glass):
+    /// [`Self::vibrancy_tone`] at [`Brand::vibrancy_alpha`](crate::Brand::vibrancy_alpha).
+    /// Opaque, this IS the surface tone.
     pub fn vibrancy_tint(&self) -> Hsla {
         let alpha = self.vibrancy_alpha;
         if alpha >= 1.0 {
             return self.surface;
         }
-        match self.appearance {
-            Appearance::Dark => color::grey(8).opacity(alpha),
-            Appearance::Light => self.material.tone.opacity(alpha),
-        }
+        self.vibrancy_tone.opacity(alpha)
     }
 
     /// The app's root fill: the frost where glass is on, the opaque panel
@@ -30,6 +26,27 @@ impl Theme {
             self.vibrancy_tint()
         } else {
             self.bg
+        }
+    }
+
+    /// What a content card paints over [`Self::sidebar_bg`]:
+    /// [`Self::content_background`] at [`Self::content_opacity`] where
+    /// [`Self::vibrancy`] is on, and opaque [`Self::bg`](Self#structfield.bg)
+    /// where it is not.
+    pub fn content_bg(&self) -> Hsla {
+        match self.vibrancy {
+            true => self.content_background.opacity(self.content_opacity),
+            false => self.bg,
+        }
+    }
+
+    /// A sidebar's fill: the frost where glass is on, [`Self::surface`] where
+    /// it is not.
+    pub fn sidebar_bg(&self) -> Hsla {
+        if self.vibrancy {
+            self.vibrancy_tint()
+        } else {
+            self.surface
         }
     }
 
@@ -49,7 +66,7 @@ impl Theme {
 
     /// The composer pill / question panel fill. Light's `input_bg` is opaque
     /// white (the elevation ladder on an opaque page) — over glass it read as
-    /// a solid slab in front of the frosted blur, so it thins to a
+    /// a solid slab in front of the blurred backdrop, so it thins to a
     /// translucent tint there (0.6 and then 0.45 both still read too bright
     /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
     /// is already glass-native.

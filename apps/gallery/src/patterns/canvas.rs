@@ -59,7 +59,7 @@ const SOURCE: &str = r##"{
 /// The sample's root, the one node the page will not let go.
 const ROOT: &str = "root";
 
-/// Installed with `canvas::set_kinds` under `"session"`.
+/// Installed with `canvas::AppExt::set_canvas_kinds` under `"session"`.
 pub fn session_kind() -> Kind {
     Kind::new(session).edit(Field::new(title, set_title))
 }
@@ -85,7 +85,8 @@ fn session(node: &Node, look: Look, _: &mut Window, cx: &mut App) -> AnyElement 
         .and_then(|turns| turns.as_u64())
         .unwrap_or_default();
     let title = look.editor.unwrap_or_else(|| {
-        canvas::text_style(div(), TextStyle::Headline, zoom)
+        div()
+            .text_style_at(TextStyle::Headline, zoom)
             .text_color(theme.text)
             .child(title(node))
             .into_any_element()
@@ -93,7 +94,8 @@ fn session(node: &Node, look: Look, _: &mut Window, cx: &mut App) -> AnyElement 
     kind::chrome(Chrome::Card, node, zoom, cx)
         .child(title)
         .child(
-            canvas::text_style(div(), TextStyle::Callout, zoom)
+            div()
+                .text_style_at(TextStyle::Callout, zoom)
                 .text_color(theme.text_muted)
                 .child(format!("Session · {turns} turns")),
         )
@@ -470,7 +472,7 @@ impl CanvasDemo {
             .gap(px(12.0))
             .pb(px(12.0))
             .border_b_1()
-            .border_color(theme.hairline(0.10))
+            .border_color(theme.border)
             .child(add)
             .child(history)
             .child(

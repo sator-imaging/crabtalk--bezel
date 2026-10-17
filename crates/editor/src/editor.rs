@@ -11,23 +11,23 @@
 //! turning a click into a position.
 
 use gpui::{
-    App, Context, CursorStyle, ElementInputHandler, EventEmitter, FocusHandle, Focusable,
+    App, Context, CursorStyle, ElementInputHandler, Entity, EventEmitter, FocusHandle, Focusable,
     KeyContext, MouseButton, Render, Styled as _, Task, Window, canvas, div, prelude::*,
 };
 use markdown::{
-    Annotation, Block, BlockKind, BlockLayouts, Cursor, Doc, Form, Mark, Part, Selection, Splice,
-    Text, edit, edit::shortcut,
+    Affinity, Annotation, AppExt as _, Block, BlockKind, BlockLayouts, Cursor, Doc, Form, Mark,
+    Part, Selection, Splice, Synced, Text, edit, edit::shortcut,
 };
-use std::{ops::Range, time::Duration};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 use theme::Theme;
 
 use crate::{
     anchor::{Anchor, AnchorId, Delta},
-    history::{EditKind, History},
-    layout::Layout,
+    document::{Change, Document, DocumentEvent, Tracked},
+    history::{EditKind, Run},
     link::{self, Choice},
-    slash::Slash,
-    text_size::{self, TextSize},
+    slash::{Slash, SlashAction, SlashAt},
+    text_size,
 };
 
 mod anchors;
@@ -38,9 +38,12 @@ pub(crate) mod image;
 mod input;
 pub mod keys;
 pub(crate) mod menu;
-mod mode;
+pub(crate) mod mode;
 mod pointer;
 mod render;
+mod sizing;
+mod sync;
+mod table;
 mod typing;
 
 pub use keys::init;
@@ -57,7 +60,7 @@ use keys::{
 pub const CONTEXT: &str = "BezelEditor";
 
 /// The custom mark [`ToggleHighlight`] toggles. It does nothing until the app
-/// registers a mark under this name with [`markdown::set_marks`].
+/// registers a mark under this name with [`markdown::AppExt::set_marks`].
 pub const HIGHLIGHT_MARK: &str = "highlight";
 
 /// [`CONTEXT`], which every binding in [`keys`] is scoped to, plus the mark
@@ -80,6 +83,9 @@ pub enum EditorEvent {
     Changed,
     /// A click landed on an anchor's range.
     AnchorActivated(AnchorId),
+    /// The pointer came over an anchor's painted text, or left it: `None`
+    /// over none, and when the pointer leaves the editor.
+    AnchorHovered(Option<AnchorId>),
     /// The editor switched between the document and its source, which a host
     /// lighting its own toggle has no other way to hear about — the switch can
     /// come from an undo as well as from the button.
@@ -117,6 +123,9 @@ pub struct Chrome {
     /// The menu a pasted URL drops — leave it, or make a card, a chip or the
     /// picture it points at.
     pub paste: bool,
+    /// The mention menus over the app's [`crate::MentionSource`]s. Off by
+    /// default.
+    pub mention: bool,
 }
 
 impl Default for Chrome {
@@ -126,6 +135,7 @@ impl Default for Chrome {
             slash: true,
             language: true,
             paste: true,
+            mention: false,
         }
     }
 }
@@ -149,6 +159,8 @@ pub struct Formatting {
     /// What the caret's block is called in [`turns`], or `None` for a block the
     /// menu does not offer.
     pub block: Option<gpui::SharedString>,
+    /// The quote the caret's block sits in — see [`quotes`].
+    pub quote: Option<markdown::Quoted>,
     /// Whether [`Mark::Code`] here makes a fence out of the selection rather
     /// than an inline span — the one chord whose meaning changes with what is
     /// selected, and the one a bar cannot work out for itself.
@@ -161,6 +173,12 @@ pub struct Formatting {
 /// bezel's own menus call.
 pub fn turns() -> Vec<(gpui::SharedString, BlockKind)> {
     crate::slash::items()
+}
+
+/// Every quote a block can be put in, and what each is called. Pair with
+/// [`Editor::toggle_quote`].
+pub fn quotes() -> Vec<(gpui::SharedString, Option<markdown::QuoteKind>)> {
+    crate::slash::quotes()
 }
 
 /// Shown on the focused block while it is empty — the only discoverable place
@@ -205,23 +223,6 @@ fn fenceable(doc: &Doc, selection: Selection) -> bool {
                 .any(|(at, range)| covered(at, range).is_some_and(|text| text.contains('\n'))))
 }
 
-/// Give an empty document a block to hold a caret, and say whether one was
-/// needed.
-///
-/// A [`Doc`] with no blocks is a legitimate document — it is what `parse("")`
-/// returns — but it is not something that can be edited: nothing paints, so
-/// there is no caret and no placeholder, and neither a click nor a hit test
-/// has a target to find. An empty file would sit inert until something typed
-/// a block into existence, which is the one thing you cannot do with no caret.
-fn ensure_block(doc: &mut Doc) -> bool {
-    if !doc.blocks.is_empty() {
-        return false;
-    }
-    doc.blocks
-        .push(Block::new(BlockKind::Paragraph(Text::default())));
-    true
-}
-
 fn line_home(at: Cursor, doc: &Doc) -> Cursor {
     let Some(text) = doc
         .blocks
@@ -260,15 +261,41 @@ fn source_doc(source: &str) -> Doc {
         blocks: vec![Block::new(BlockKind::Code {
             language: Some(markdown::source::LANGUAGES[0].to_string()),
             code: Text::plain(source),
+            height: None,
         })],
     }
 }
 
-/// One of the two floating menus a block drops — the block it belongs to and
-/// where it hangs. A `Popup` rather than an `Option` for the exit phase, and
-/// for the press note: the card's `on_mouse_down_out` fires on the *press*, so
-/// without one a trigger's click on the *release* reopens what it just shut.
-pub(crate) type MenuPopup = ui::popover::Popup<(usize, gpui::Point<gpui::Pixels>)>;
+/// A floating menu a block drops. A `Popup` rather than an `Option` for the
+/// exit phase, and for the press note: the card's `on_mouse_down_out` fires on
+/// the *press*, so without one a trigger's click on the *release* reopens what
+/// it just shut.
+pub(crate) type MenuPopup<T> = ui::popover::Popup<Dropped<T>>;
+
+/// What a dropped menu belongs to, where it hangs, and its live row.
+pub(crate) struct Dropped<T> {
+    pub of: T,
+    pub at: gpui::Point<gpui::Pixels>,
+    pub cursor: ui::menu::Cursor,
+}
+
+impl<T> Dropped<T> {
+    pub fn new(of: T, at: gpui::Point<gpui::Pixels>) -> Self {
+        Self {
+            of,
+            at,
+            cursor: ui::menu::Cursor::default(),
+        }
+    }
+}
+
+/// The row, column, or cell whose table menu is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableTarget {
+    Row(usize),
+    Column(usize),
+    Cell { row: usize, column: usize },
+}
 
 /// A table's row or column, as [`markdown::Part::Cell`] numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,18 +304,37 @@ pub(crate) enum Line {
     Column(usize),
 }
 
+/// Where a reveal leaves the caret's row in the scroll box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reveal {
+    /// The least scroll that brings the row inside the box.
+    Nearest,
+    /// The row at the box's top edge, or as near it as the document's end
+    /// allows.
+    Top,
+}
+
 pub struct Editor {
-    doc: Doc,
-    /// The dialect this document is read and written in — the app's own marks,
-    /// taken once at construction. One editor, one spelling: a document that
-    /// changed dialect between a read and a write would rewrite itself.
+    document: Entity<Document>,
+    /// This editor's snapshot of the document, its form, its marks and its
+    /// anchors: what it edits, handed back to [`Self::document`] after each
+    /// change, and replaced whenever another editor changes the document.
+    doc: Tracked,
+    /// The source view's text and the [`Tracked::revision`] it was built at.
+    /// Read only in [`Mode::Source`].
+    source_view: Option<(u64, markdown::SourceText)>,
+    /// Highlighting the source view's text after an edit. Dropping it cancels.
+    source_spans: Option<Task<()>>,
     marks: markdown::Marks,
+    /// The document's markdown and blocks, shared with it — see
+    /// [`Document`]'s field of the name.
+    synced: Rc<RefCell<Synced>>,
     /// Which of the editor's own affordances paint. The app's, so one document
     /// can carry the lot and another none of it.
     chrome: Chrome,
-    /// Which form the document is in. In [`Mode::Source`] `doc` is one fenced
-    /// block holding the markdown, so every operation below that is about
-    /// *blocks* asks [`Editor::blocks`] first.
+    /// In [`Mode::Source`] `doc` is one fenced block holding the markdown, so
+    /// every operation below that is about *blocks* asks [`Editor::blocks`]
+    /// first.
     mode: Mode,
     /// Collapsed for an ordinary caret, so there is one position here rather
     /// than a caret and a range that can disagree.
@@ -300,21 +346,22 @@ pub struct Editor {
     /// Where each text landed last frame, so a click can be turned into a
     /// caret. Only paint knows this, so the renderer fills it.
     layouts: BlockLayouts,
-    history: History,
+    run: Run,
     /// Which half of the blink the caret is in. Flipped by [`Self::start_blink`].
     caret_on: bool,
     /// The blink, alive only while the document holds focus.
     blink: Option<Task<()>>,
-    /// Comment ranges, mapped through every edit and snapshotted with the
-    /// document. Here rather than in the app because an undo restores a whole
-    /// document and leaves no delta an app could map its own copy through.
     anchors: Vec<Anchor>,
+    /// Ranges washed for one frame's worth of the app's say — find hits. Not
+    /// mapped through edits and not in the history: the app sets them again.
+    washes: Vec<(Selection, Annotation)>,
     /// Marks the next typed character will carry — cmd-B at a collapsed caret,
     /// which otherwise has no range to apply to and so would do nothing.
     /// Cleared by any motion, because they belong to a spot and not to a mood.
     stored: Vec<Mark>,
     /// The open slash menu, if `/` started one.
     slash: Option<Slash>,
+    mention: Option<crate::mention::MentionMenu>,
     /// The open paste menu, if a URL landed in a block of its own.
     pasted: Option<link::Paste>,
     /// The open prompt, if an image is waiting to be told where to look.
@@ -326,7 +373,14 @@ pub struct Editor {
     /// The table cell the pointer is over, whose row and column show handles.
     hovered_cell: Option<(usize, Part)>,
     /// A table row's or column's menu: the table, the line and where it hangs.
-    table_menu: ui::popover::Popup<(usize, Line, gpui::Point<gpui::Pixels>)>,
+    table_drag: Option<table::TableDrag>,
+    table_dragged: bool,
+    table_menu: MenuPopup<(usize, TableTarget)>,
+    /// The right-click menu on text, with its rows as they stood when it
+    /// opened.
+    text_menu: MenuPopup<Vec<ui::menu::Item>>,
+    /// The right-click menu on a picture.
+    image_menu: MenuPopup<markdown::PictureMenu>,
     /// A block being dragged by its handle, and where it would land.
     lifted: Option<(usize, usize)>,
     /// An image being dragged wider or narrower by its edge handle, and the
@@ -336,10 +390,12 @@ pub struct Editor {
     /// document's own value here is what makes a press that never moved
     /// read back as no change at all.
     resizing: Option<(usize, Option<u32>)>,
-    /// The block menu the handle opened, and where to anchor it.
-    block_menu: MenuPopup,
-    /// The language menu a fence's header opened, and the block it belongs to.
-    language_menu: MenuPopup,
+    /// A painted block being dragged taller or shorter by its bottom handle.
+    sizing: Option<sizing::Sizing>,
+    /// The block menu the handle opened, over the block and its rows.
+    block_menu: MenuPopup<(usize, crate::slash::Rows)>,
+    /// The language menu a fence's header opened, over its block.
+    language_menu: MenuPopup<usize>,
     /// Set by a floating layer's press — the gutter handle, the URL prompt —
     /// so the editor's own press does not undo what that press just did.
     press_claimed: bool,
@@ -350,20 +406,27 @@ pub struct Editor {
     /// ceiling, and no drag could ever widen it again.
     origin: gpui::Point<gpui::Pixels>,
     width: gpui::Pixels,
-    /// Whether the pointer is dragging out a selection.
-    dragging: bool,
+    /// The press being dragged out: what it selects by, and what it selected.
+    dragging: Option<(ui::input::Granularity, Range<Cursor>)>,
     /// Whether the pointer is over painted text, which is the only place the
     /// editor claims an I-beam.
     over_text: bool,
-    /// The host's scroll box, when it gave one, and whether the caret still
-    /// owes it a reveal.
+    /// The anchor whose text the pointer is over — see
+    /// [`EditorEvent::AnchorHovered`].
+    over_anchor: Option<AnchorId>,
+    /// The host's scroll box, when it gave one, and the reveal the caret still
+    /// owes it.
     scroll: Option<gpui::ScrollHandle>,
-    reveal: bool,
+    reveal: Option<Reveal>,
+    /// Where a held drag last was, in window coordinates.
+    drag_at: Option<gpui::Point<gpui::Pixels>>,
+    /// Scrolls [`Self::scroll`] while a drag is held past its top or bottom.
+    edge_scroll: Option<Task<()>>,
     /// Where the gutter handle was placed this frame, so the frame after can
     /// tell whether the block moved out from under it.
     handle_at: Option<gpui::Point<gpui::Pixels>>,
-    /// The column and row held across consecutive vertical moves.
-    goal: Option<VerticalGoal>,
+    /// The column held across consecutive vertical moves.
+    goal: Option<gpui::Pixels>,
     /// The size the app set this document in, in points, or `None` to follow
     /// the app's own text size. Absolute rather than a factor over the ladder,
     /// so moving the interface size leaves a document set to 16pt at 16pt.
@@ -373,81 +436,97 @@ pub struct Editor {
     text_size: Option<f32>,
     /// The directory relative image paths resolve against.
     base: Option<std::path::PathBuf>,
-}
-
-#[derive(Clone, Copy)]
-struct VerticalGoal {
-    x: gpui::Pixels,
-    /// Relative to the caret's painted position so scrolling cannot change the row.
-    row_from_caret: gpui::Pixels,
+    image_overlay: Option<markdown::ImageOverlay>,
+    image_overlay_corner: markdown::ImageOverlayCorner,
+    _document: gpui::Subscription,
 }
 
 impl Editor {
+    /// An editor on a document of its own.
     pub fn new(source: &str, cx: &mut Context<Self>) -> Self {
-        let marks = markdown::Marks::of(cx);
-        let mut doc = markdown::parse_with(source, &marks);
-        ensure_block(&mut doc);
+        let document = cx.new(|cx| Document::new(source, cx));
+        Self::for_document(document, cx)
+    }
+
+    /// An editor on `document`, beside any others already on it.
+    pub fn for_document(document: Entity<Document>, cx: &mut Context<Self>) -> Self {
+        let (doc, mode, marks, synced, anchors) = {
+            let document = document.read(cx);
+            (
+                document.doc.clone(),
+                document.mode,
+                document.marks.clone(),
+                document.synced.clone(),
+                document.anchors.clone(),
+            )
+        };
+        let subscription = cx.subscribe(&document, |this, document, event: &DocumentEvent, cx| {
+            if event.by != Some(cx.entity_id()) {
+                this.take_document(&document, &event.change, cx);
+            }
+        });
         Self {
+            document,
             marks,
             // Clamped, not defaulted: a document opening on a fence or a table
             // has no body at block zero, and a caret claiming one resolves
             // against nothing until something moves it.
             selection: Selection::at(Cursor::default().clamp(&doc)),
             doc,
+            mode,
+            synced,
+            anchors,
+            source_view: None,
+            source_spans: None,
             chrome: Chrome::default(),
-            mode: Mode::default(),
             focus_handle: cx.focus_handle(),
             marked: None,
             layouts: BlockLayouts::default(),
-            history: History::default(),
+            run: Run::default(),
             caret_on: true,
             blink: None,
-            anchors: Vec::new(),
+            washes: Vec::new(),
             stored: Vec::new(),
             slash: None,
+            mention: None,
             pasted: None,
             url_prompt: None,
             dropping: None,
             hovered: None,
             hovered_cell: None,
             table_menu: Default::default(),
+            text_menu: Default::default(),
+            image_menu: Default::default(),
+            table_drag: None,
+            table_dragged: false,
             lifted: None,
             resizing: None,
+            sizing: None,
             block_menu: MenuPopup::default(),
             language_menu: MenuPopup::default(),
             press_claimed: false,
             origin: gpui::Point::default(),
             width: gpui::Pixels::ZERO,
-            dragging: false,
+            dragging: None,
             over_text: false,
+            over_anchor: None,
             scroll: None,
-            reveal: false,
+            reveal: None,
+            drag_at: None,
+            edge_scroll: None,
             goal: None,
             handle_at: None,
             text_size: None,
             base: None,
+            image_overlay: None,
+            image_overlay_corner: markdown::ImageOverlayCorner::default(),
+            _document: subscription,
         }
     }
 
-    /// How many undo steps to keep. App-wide configuration would be a gpui
-    /// global alongside [`init`], not a `Theme` field — the theme is rebuilt on
-    /// every light/dark switch, which would quietly reset anything behavioural
-    /// parked in it.
-    pub fn with_undo_limit(mut self, limit: usize) -> Self {
-        self.history = History::with_limit(limit);
-        self
-    }
-
-    /// Read and write this document with marks of its own, rather than the ones
-    /// [`markdown::set_marks`] installed. For an app whose editors do not all
-    /// speak the same dialect.
-    pub fn with_marks(mut self, marks: markdown::Marks) -> Self {
-        let source = self.source();
-        self.marks = marks;
-        self.doc = markdown::parse_with(&source, &self.marks);
-        ensure_block(&mut self.doc);
-        self.selection = self.selection.clamp(&self.doc);
-        self
+    /// The document this editor is a view of.
+    pub fn document(&self) -> &Entity<Document> {
+        &self.document
     }
 
     /// Which of the editor's own affordances to paint. See [`Chrome`].
@@ -456,19 +535,41 @@ impl Editor {
         self
     }
 
+    /// Adds an app-provided hover control to pictures in rich mode.
+    pub fn with_image_overlay(mut self, overlay: markdown::ImageOverlay) -> Self {
+        self.image_overlay = Some(overlay);
+        self
+    }
+
+    /// Replaces or removes the picture hover control.
+    pub fn set_image_overlay(
+        &mut self,
+        overlay: Option<markdown::ImageOverlay>,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_overlay = overlay;
+        cx.notify();
+    }
+
+    /// Positions picture hover controls; bottom-right by default.
+    pub fn with_image_overlay_corner(mut self, corner: markdown::ImageOverlayCorner) -> Self {
+        self.image_overlay_corner = corner;
+        self
+    }
+
+    /// Repositions the picture hover control.
+    pub fn set_image_overlay_corner(
+        &mut self,
+        corner: markdown::ImageOverlayCorner,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_overlay_corner = corner;
+        cx.notify();
+    }
+
     /// What is painting now, for an app whose own bar mirrors it.
     pub fn chrome(&self) -> Chrome {
         self.chrome
-    }
-
-    /// Open in [`Mode::Source`] rather than on the document — an app whose
-    /// editor is a markdown file first. Nothing is recorded: this is where the
-    /// document starts, not a switch to step back over.
-    pub fn with_mode(mut self, mode: Mode) -> Self {
-        if mode != self.mode {
-            self.switch(mode);
-        }
-        self
     }
 
     /// Open the document at a size of its own, in points — the app's settings
@@ -490,7 +591,7 @@ impl Editor {
     }
 
     /// The base the app set, if any. Add
-    /// [`text_size_adjustment`](crate::text_size_adjustment) for what is on
+    /// [`crate::AppExt::editor_text_size_adjustment`](crate::AppExt::editor_text_size_adjustment) for what is on
     /// screen.
     pub fn text_size(&self) -> Option<f32> {
         self.text_size
@@ -518,7 +619,7 @@ impl Editor {
     }
 
     /// The box the document scrolls in, so typing off the bottom follows the
-    /// caret down.
+    /// caret down and a drag held past its top or bottom scrolls it.
     ///
     /// The host's rather than the editor's: a document goes in whatever pane
     /// the app gives it, and the gutter handle, the drop indicator and the
@@ -543,9 +644,19 @@ impl Editor {
     /// Clamped, because the caller's range came from somewhere the document may
     /// have moved on from.
     pub fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        self.select_revealing(selection, Reveal::Nearest, cx);
+    }
+
+    /// [`Self::select`], scrolling the caret's row to the top of the scroll
+    /// box — what a jump to a heading wants, from either side of it.
+    pub fn select_to_top(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        self.select_revealing(selection, Reveal::Top, cx);
+    }
+
+    fn select_revealing(&mut self, selection: Selection, reveal: Reveal, cx: &mut Context<Self>) {
         self.selection = selection.clamp(&self.doc);
-        self.history.interrupt();
-        self.reveal = true;
+        self.run.interrupt();
+        self.reveal = Some(reveal);
         self.caret_moved();
         cx.notify();
     }
@@ -572,7 +683,9 @@ impl Editor {
         if self.selection.is_collapsed() {
             return None;
         }
-        let (point, line_height) = self.layouts.position(self.selection.head)?;
+        let (point, line_height) = self
+            .layouts
+            .position(self.selection.head, self.selection.affinity)?;
         Some(gpui::Bounds::new(
             point,
             gpui::size(gpui::px(0.0), line_height),

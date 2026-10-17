@@ -15,7 +15,7 @@
 //!
 //! The registry is a *parameter* rather than a global because [`parse_with`]
 //! and [`serialize_with`] are pure — the same reason the highlighter is a
-//! function pointer rather than a dependency. [`set_marks`] is the gpui-side
+//! function pointer rather than a dependency. [`crate::AppExt::set_marks`] is the gpui-side
 //! half, for the editing surface, which has a `cx` and no other way to know.
 //!
 //! A delimiter markdown already spells (`*`, `_`, `` ` ``, `~`, `[`) is yours to
@@ -99,7 +99,7 @@ impl Marks {
     }
 
     /// What the editing surface reads a document with, or nothing registered.
-    pub fn of(cx: &App) -> Self {
+    pub(crate) fn of(cx: &App) -> Self {
         cx.try_global::<Installed>()
             .map_or_else(Self::default, |installed| installed.0.clone())
     }
@@ -109,17 +109,17 @@ struct Installed(Marks);
 
 impl Global for Installed {}
 
-/// `markdown::set_marks(cx, my_marks)` — call once at boot, so the editing
+/// `cx.set_marks(my_marks)` — call once at boot, so the editing
 /// surface reads and writes the same markdown the app's own calls do.
-pub fn set_marks(cx: &mut App, marks: Marks) {
+pub(crate) fn set_marks(cx: &mut App, marks: Marks) {
     cx.set_global(Installed(marks));
 }
 
-/// How a custom mark paints. Everything a [`gpui::TextRun`] can carry, and
-/// nothing a layout would have to move for.
+/// How a custom mark paints: nothing a layout would have to move for.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MarkPaint {
     pub color: Option<Hsla>,
+    /// Painted under the text and over the selection.
     pub background: Option<Hsla>,
     pub weight: Option<FontWeight>,
     pub italic: bool,
@@ -135,10 +135,10 @@ struct InstalledPaint(Painter);
 
 impl Global for InstalledPaint {}
 
-/// `markdown::set_mark_paint(cx, my_paint)` — call once at boot. Without it a
+/// `cx.set_mark_paint(my_paint)` — call once at boot. Without it a
 /// custom mark round trips and paints as the text it wraps, which is what an
 /// unknown mark should look like rather than a hole.
-pub fn set_mark_paint(cx: &mut App, paint: Painter) {
+pub(crate) fn set_mark_paint(cx: &mut App, paint: Painter) {
     cx.set_global(InstalledPaint(paint));
 }
 
@@ -149,7 +149,7 @@ pub(crate) fn paint_of(cx: &App, name: &str, theme: &Theme) -> Option<MarkPaint>
 /// A reader's highlight colour, by name — the set Apple Books and Notes offer.
 ///
 /// A name rather than a colour value, so a highlight saved under one look
-/// paints under another. [`set_highlight_paint`] decides what each one paints.
+/// paints under another. [`crate::AppExt::set_highlight_paint`] decides what each one paints.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum HighlightColor {
@@ -186,6 +186,17 @@ impl HighlightColor {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|color| color.name() == name)
     }
+
+    /// The system colour it paints in.
+    pub fn system(self) -> ui::color::SystemColor {
+        match self {
+            Self::Yellow => ui::color::SystemColor::Yellow,
+            Self::Green => ui::color::SystemColor::Green,
+            Self::Blue => ui::color::SystemColor::Blue,
+            Self::Pink => ui::color::SystemColor::Pink,
+            Self::Purple => ui::color::SystemColor::Purple,
+        }
+    }
 }
 
 /// The wash a [`HighlightColor`] paints under text.
@@ -195,9 +206,9 @@ struct InstalledHighlight(HighlightPaint);
 
 impl Global for InstalledHighlight {}
 
-/// `markdown::set_highlight_paint(cx, my_paint)` — call once at boot. Without
+/// `cx.set_highlight_paint(my_paint)` — call once at boot. Without
 /// it each colour paints [`default_highlight`].
-pub fn set_highlight_paint(cx: &mut App, paint: HighlightPaint) {
+pub(crate) fn set_highlight_paint(cx: &mut App, paint: HighlightPaint) {
     cx.set_global(InstalledHighlight(paint));
 }
 
@@ -206,31 +217,24 @@ pub(crate) fn highlight_paint_of(cx: &App) -> HighlightPaint {
         .map_or(default_highlight, |installed| installed.0)
 }
 
-/// A [`HighlightColor`] itself, at full strength — Apple's system colour for
-/// the appearance. What a picker paints a swatch in.
+/// A [`HighlightColor`] itself, at full strength: its
+/// [`ui::color::SystemColor`] for the appearance. What a picker paints a
+/// swatch in.
 pub fn highlight_solid(color: HighlightColor, theme: &Theme) -> Hsla {
-    let dark = theme.appearance == theme::Appearance::Dark;
-    let hex = match color {
-        HighlightColor::Yellow if dark => 0xFFD60A,
-        HighlightColor::Yellow => 0xFFCC00,
-        HighlightColor::Green if dark => 0x32D74B,
-        HighlightColor::Green => 0x28CD41,
-        HighlightColor::Blue if dark => 0x0A84FF,
-        HighlightColor::Blue => 0x007AFF,
-        HighlightColor::Pink if dark => 0xFF375F,
-        HighlightColor::Pink => 0xFF2D55,
-        HighlightColor::Purple if dark => 0xBF5AF2,
-        HighlightColor::Purple => 0xAF52DE,
-    };
-    gpui::rgb(hex).into()
+    color.system().resolve(theme)
 }
 
-/// The shipped washes: [`highlight_solid`] at a fixed alpha, translucent so a
-/// selection over one still shows.
-pub fn default_highlight(color: HighlightColor, theme: &Theme) -> Hsla {
+/// The wash a highlight of `color` paints under text: `color` at 32% in the
+/// dark appearance and 45% in the light.
+pub fn highlight_wash(color: Hsla, theme: &Theme) -> Hsla {
     let alpha = match theme.appearance {
         theme::Appearance::Dark => 0.32,
         theme::Appearance::Light => 0.45,
     };
-    highlight_solid(color, theme).opacity(alpha)
+    color.opacity(alpha)
+}
+
+/// The shipped washes: [`highlight_wash`] of [`highlight_solid`].
+pub fn default_highlight(color: HighlightColor, theme: &Theme) -> Hsla {
+    highlight_wash(highlight_solid(color, theme), theme)
 }

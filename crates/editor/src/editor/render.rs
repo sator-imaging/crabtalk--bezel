@@ -1,13 +1,19 @@
 use super::*;
+use crate::AppExt as _;
+use std::rc::Rc;
+use ui::AppExt as _;
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(mention) = &mut self.mention {
+            mention.refresh(cx);
+        }
         let theme = Theme::of(cx).clone();
-        let layout = Layout::of(cx);
+        let layout = cx.editor_layout();
         let focused = self.focus_handle.is_focused(window);
         // The only place the blink starts: `caret_moved` drops the task, so the
         // next render brings it back in phase, lit beat first.
-        if focused && ui::input::caret_blink(cx) {
+        if focused && cx.caret_blink() {
             if self.blink.is_none() {
                 self.start_blink(cx);
             }
@@ -18,11 +24,14 @@ impl Render for Editor {
         let selection = focused.then_some(self.selection);
         // The source line a reveal owed in source mode lands on.
         let reveal_line = match self.mode {
-            Mode::Source => self
-                .source_text()
-                .get(..self.selection.head.offset)
-                .map_or(0, |before| before.matches('\n').count()),
-            Mode::Blocks => 0,
+            Mode::Source => {
+                self.refresh_source_view(cx);
+                self.source_view().line_of(self.selection.head.offset)
+            }
+            Mode::Blocks => {
+                self.drop_source_view();
+                0
+            }
         };
         // gpui ends an outside file drag — left the window or released
         // elsewhere — without a drop here, so the indicator goes with it.
@@ -107,12 +116,36 @@ impl Render for Editor {
                     window.prevent_default();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if this.blocks()
+                        && let Some((block, Part::Cell { row, column })) =
+                            this.layouts.cell_at(event.position)
+                    {
+                        this.table_menu.open(Dropped::new(
+                            (block, TableTarget::Cell { row, column }),
+                            event.position,
+                        ));
+                        this.focus_handle.focus(window, cx);
+                    } else {
+                        this.right_pressed(event.position, window, cx);
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
             // The drag has to be tracked from the container rather than from a
             // payload: a text selection has nothing to carry, and gpui's drag
             // payload is for things being dropped somewhere.
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !*hovered && (this.hovered.take().is_some() | this.hovered_cell.take().is_some())
                 {
+                    cx.notify();
+                }
+                if !*hovered && this.over_anchor.take().is_some() {
+                    cx.emit(EditorEvent::AnchorHovered(None));
                     cx.notify();
                 }
             }))
@@ -130,8 +163,25 @@ impl Render for Editor {
                 if this.in_drag() {
                     return;
                 }
+                let over = match this.over_text {
+                    true => this.anchor_at(event.position),
+                    false => None,
+                };
+                if over != this.over_anchor {
+                    this.over_anchor = over;
+                    cx.emit(EditorEvent::AnchorHovered(over));
+                    // The pointer's shape follows the anchor under it.
+                    cx.notify();
+                }
                 let hovered = this.layouts.block_at(event.position);
-                let cell = this.layouts.cell_at(event.position);
+                let cell = this.layouts.cell_at(event.position).or_else(|| {
+                    // Keep the target while crossing its control lanes.
+                    this.hovered_cell.filter(|(block, _)| {
+                        this.layouts
+                            .block_bounds(*block)
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                    })
+                });
                 if hovered != this.hovered || cell != this.hovered_cell {
                     this.hovered = hovered;
                     this.hovered_cell = cell;
@@ -143,16 +193,26 @@ impl Render for Editor {
             // its stand-in picture painted over the document for good.
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
-                    this.dragging = false;
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    this.drag_table_to(event.position, cx);
+                    this.dragging = None;
                     this.drop_resize(window, cx);
+                    this.drop_height(cx);
+                    this.drop_table_drag(cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
-                    this.dragging = false;
+                    this.drag_table_to(event.position, cx);
+                    this.dragging = None;
+                    if this.drop_table_drag(cx) {
+                        return;
+                    }
                     if this.drop_resize(window, cx) {
+                        return;
+                    }
+                    if this.drop_height(cx) {
                         return;
                     }
                     let Some((from, to)) = this.lifted.take() else {
@@ -164,7 +224,9 @@ impl Render for Editor {
                         // press is what dismissed it, which the note taken on
                         // the way down is the only way to tell.
                         if !this.block_menu.take_press_was_open() {
-                            this.block_menu.open((from, event.position));
+                            let rows = crate::slash::Rows::new(crate::block_menu::installed(cx));
+                            this.block_menu
+                                .open(Dropped::new((from, rows), event.position));
                         }
                         return cx.notify();
                     }
@@ -180,7 +242,7 @@ impl Render for Editor {
                         let mut deltas = Vec::new();
                         for _ in 0..this.doc.blocks.len() {
                             let span = this.doc.subtree(at);
-                            let Some(next) = this.doc.move_block(at, delta) else {
+                            let Some(next) = this.doc.edit().move_block(at, delta) else {
                                 break;
                             };
                             deltas.push(Delta::Moved {
@@ -200,9 +262,7 @@ impl Render for Editor {
             )
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
-            .on_action(
-                cx.listener(|this, _: &KillLine, _, cx| this.delete_to(true, Cursor::end, cx)),
-            )
+            .on_action(cx.listener(|this, _: &KillLine, _, cx| this.delete_to(true, line_end, cx)))
             .on_action(cx.listener(|this, _: &DeleteWordLeft, _, cx| {
                 this.delete_to(false, Cursor::word_left, cx)
             }))
@@ -280,19 +340,19 @@ impl Render for Editor {
             // Motion is one method with a `Cursor` function and an "extend"
             // flag, so a shift variant cannot drift from the key it shadows.
             .on_action(cx.listener(|this, _: &Left, _, cx| {
-                if !this.slash_side(false, cx) {
-                    this.moved(false, Cursor::left, cx)
+                if !this.menu_side(false, cx) {
+                    this.horizontal(false, false, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &Right, _, cx| {
-                if !this.slash_side(true, cx) {
-                    this.moved(false, Cursor::right, cx)
+                if !this.menu_side(true, cx) {
+                    this.horizontal(true, false, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &Up, _, cx| this.vertical(false, false, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.vertical(true, false, cx)))
-            .on_action(cx.listener(|this, _: &Home, _, cx| this.moved(false, line_home, cx)))
-            .on_action(cx.listener(|this, _: &End, _, cx| this.moved(false, line_end, cx)))
+            .on_action(cx.listener(|this, _: &Home, _, cx| this.row_edge(false, false, cx)))
+            .on_action(cx.listener(|this, _: &End, _, cx| this.row_edge(true, false, cx)))
             .on_action(cx.listener(|this, _: &DocumentStart, _, cx| {
                 this.moved(false, |_, doc| Selection::all(doc).anchor, cx)
             }))
@@ -305,16 +365,12 @@ impl Render for Editor {
             .on_action(
                 cx.listener(|this, _: &WordRight, _, cx| this.moved(false, Cursor::word_right, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &SelectLeft, _, cx| this.moved(true, Cursor::left, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SelectRight, _, cx| this.moved(true, Cursor::right, cx)),
-            )
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.horizontal(false, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.horizontal(true, true, cx)))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.vertical(false, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.vertical(true, true, cx)))
-            .on_action(cx.listener(|this, _: &SelectHome, _, cx| this.moved(true, line_home, cx)))
-            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| this.moved(true, line_end, cx)))
+            .on_action(cx.listener(|this, _: &SelectHome, _, cx| this.row_edge(false, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectEnd, _, cx| this.row_edge(true, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDocumentStart, _, cx| {
                 this.moved(true, |_, doc| Selection::all(doc).anchor, cx)
             }))
@@ -333,15 +389,34 @@ impl Render for Editor {
             // reaches over its gutter, the margin beside a short line, a rule,
             // an image and a card, none of which a caret can be put into.
             // Where it has nothing to say it stays quiet rather than
-            // overriding the page with an arrow of its own.
-            .when(self.over_text || self.dragging, |el| {
-                el.cursor(CursorStyle::IBeam)
+            // overriding the page with an arrow of its own. Over an actionable
+            // anchor it is a hand: a press there does what the app says.
+            .map(|el| {
+                if self.dragging.is_none() && self.over_actionable() {
+                    el.cursor(CursorStyle::PointingHand)
+                } else if self.over_text || self.dragging.is_some() {
+                    el.cursor(CursorStyle::IBeam)
+                } else {
+                    el
+                }
             })
             // No focus ring. A ring says *widget*, and a document is not one —
             // the caret already paints only while focused, so a box around the
             // whole page is a second, louder signal for the same fact.
             .relative()
             .child(input)
+            // A height drag holds the resize cursor wherever the pointer
+            // runs, over the editor's text and the card's own cursors alike.
+            .when(self.sizing.is_some(), |el| {
+                el.child(
+                    canvas(
+                        |_, _, _| (),
+                        |_, _, window, _| window.set_window_cursor_style(CursorStyle::ResizeUpDown),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
             // The document is inset by the gutter so the handle has somewhere
             // to sit *inside* the editor. Outside it the handle is clipped by
             // any scrolling ancestor, and a pointer over it never reaches
@@ -356,18 +431,19 @@ impl Render for Editor {
                         // the same caret, the same clicks, no block chrome to
                         // suppress a piece at a time.
                         Mode::Source => markdown::render_source(
-                            self.source_text(),
+                            self.source_view(),
                             markdown::Editing {
                                 selection,
                                 caret_on: self.caret_on,
                                 layouts: Some(&self.layouts),
-                                keep: if self.reveal {
+                                annotations: &self.annotations(),
+                                keep: if self.reveal.is_some() {
                                     std::slice::from_ref(&reveal_line)
                                 } else {
                                     &[]
                                 },
                                 scroll: self.scroll.as_ref(),
-                                typography: Some(markdown::Typography::of(cx).scaled(
+                                typography: Some(cx.typography().scaled(
                                     text_size::resolve(self.text_size, cx)
                                         / theme::base_text_size(),
                                 )),
@@ -390,7 +466,7 @@ impl Render for Editor {
                                 // The size is absolute, so the factor the ladder
                                 // is already scaled by comes back out of it —
                                 // otherwise the app's size and this one multiply.
-                                typography: Some(markdown::Typography::of(cx).scaled(
+                                typography: Some(cx.typography().scaled(
                                     text_size::resolve(self.text_size, cx)
                                         / theme::base_text_size(),
                                 )),
@@ -398,15 +474,56 @@ impl Render for Editor {
                                 // `checkbox_bounds`, which is what keeps a
                                 // toggle in the undo history.
                                 toggle: Some(markdown::Toggle::HitTested),
+                                table_controls: true,
+                                image_overlay: self.image_overlay.clone(),
+                                image_overlay_corner: self.image_overlay_corner,
+                                sizing: self.held_height(),
+                                fence: Some(markdown::FenceHost {
+                                    rewrite: {
+                                        let editor = cx.entity().downgrade();
+                                        Rc::new(move |ix, code, _, cx| {
+                                            editor
+                                                .update(cx, |this, cx| this.set_code(ix, code, cx))
+                                                .ok();
+                                        })
+                                    },
+                                    resize: Some({
+                                        let editor = cx.entity().downgrade();
+                                        Rc::new(move |ix, y, _, cx| {
+                                            editor
+                                                .update(cx, |this, cx| this.start_height(ix, y, cx))
+                                                .ok();
+                                        })
+                                    }),
+                                    leave: {
+                                        let editor = cx.entity().downgrade();
+                                        Rc::new(move |ix, window, cx| {
+                                            editor
+                                                .update(cx, |this, cx| {
+                                                    this.leave_block(ix, window, cx)
+                                                })
+                                                .ok();
+                                        })
+                                    },
+                                }),
                                 base: self.base.as_deref(),
                                 // A reveal owed to a caret nobody is focused on
                                 // still needs its block built to find it.
-                                keep: if self.reveal {
+                                keep: if self.reveal.is_some() {
                                     std::slice::from_ref(&self.selection.head.block)
                                 } else {
                                     &[]
                                 },
                                 scroll: self.scroll.as_ref(),
+                                jump: Some({
+                                    let editor = cx.entity().downgrade();
+                                    Rc::new(move |ix, _, cx| {
+                                        let at = Selection::at(Cursor::new(ix, Part::Body, 0));
+                                        editor
+                                            .update(cx, |this, cx| this.select_to_top(at, cx))
+                                            .ok();
+                                    })
+                                }),
                                 ..Default::default()
                             },
                             window,
@@ -430,7 +547,8 @@ impl Render for Editor {
                 .size(gpui::px(0.0)),
             )
             .children(self.slash_menu(&theme, window, cx))
-            .children(self.paste_menu(&theme, cx))
+            .children(self.mention_menu(&theme, window, cx))
+            .children(self.paste_menu(&theme, window, cx))
             .children(self.url_prompt(&theme, cx))
             .children(self.image_target(cx))
             .children(self.resize_preview())
@@ -439,9 +557,12 @@ impl Render for Editor {
             .children(self.drop_indicator(&theme))
             .children(self.table_strips(&theme, cx))
             .children(self.table_handles(&theme, cx))
-            .children(self.table_menu(&theme, cx))
+            .children(self.table_drop_indicator(&theme))
+            .children(self.dropdown(menu::Dropdown::Table, &theme, window, cx))
             .children(self.language_chip(&theme, cx))
-            .children(self.block_menu(&theme, cx))
-            .children(self.language_menu(&theme, cx))
+            .children(self.dropdown(menu::Dropdown::Block, &theme, window, cx))
+            .children(self.dropdown(menu::Dropdown::Language, &theme, window, cx))
+            .children(self.dropdown(menu::Dropdown::Text, &theme, window, cx))
+            .children(self.dropdown(menu::Dropdown::Image, &theme, window, cx))
     }
 }
