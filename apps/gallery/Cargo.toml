@@ -15,17 +15,17 @@ profiler = ["gpui/profiler"]
 # Runs on the host whatever the target is, which is what lets the web build
 # ship highlighted samples it could never compile tree-sitter to produce.
 [build-dependencies]
-syntax.workspace = true
-syntax-std.workspace = true
+syntax = { workspace = true, features = ["rust", "python", "typescript", "json", "go", "bash", "toml"] }
 theme.workspace = true
 
 [dependencies]
 agent.workspace = true
 browser.workspace = true
 canvas.workspace = true
+chart.workspace = true
 editor.workspace = true
-markdown.workspace = true
-blocks.workspace = true
+markdown = { workspace = true, features = ["mermaid"] }
+blocks = { workspace = true, features = ["vega-lite"] }
 motion.workspace = true
 theme.workspace = true
 ui.workspace = true
@@ -53,11 +53,12 @@ web-time.workspace = true
 terminal.workspace = true
 gpui_platform.workspace = true
 # The live highlighter. A web build has the build script's table instead.
-syntax.workspace = true
-syntax-std.workspace = true
+syntax = { workspace = true, features = ["rust", "python", "typescript", "json", "go", "bash", "toml"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+# The samples on the Mermaid tab, drawn without a window.
+mermaid.workspace = true
 # `TestAppContext` — a window without a display, which is what lets the
 # catalog's declared examples be compared against the ones a page paints.
 gpui = { workspace = true, features = ["test-support"] }

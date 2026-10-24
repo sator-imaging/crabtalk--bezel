@@ -5,7 +5,7 @@ use super::*;
 impl Editor {
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selection = Selection::all(&self.doc);
-        self.history.interrupt();
+        self.run.interrupt();
         self.caret_moved();
         cx.notify();
     }
@@ -40,7 +40,7 @@ impl Editor {
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(source));
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::default());
+            let splice = this.doc.edit().replace(this.selection, Text::default());
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
             vec![Delta::Spliced(splice)]
         });
@@ -52,6 +52,26 @@ impl Editor {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        if let Some(handler) = cx
+            .try_global::<crate::paste::Installed>()
+            .map(|held| held.0)
+            && let Some(content) = handler(
+                &item,
+                &cx.entity(),
+                crate::PasteContext {
+                    mode: self.mode,
+                    in_fence: self.in_fence(),
+                    base: self.base(),
+                },
+                cx,
+            )
+        {
+            match content {
+                crate::PasteContent::Literal(text) => self.paste_literal(&text, cx),
+                crate::PasteContent::Markdown(source) => self.paste_markdown(&source, cx),
+            }
+            return;
+        }
         // Source mode included: the whole document is one fence there.
         if self.in_fence() {
             if let Some(text) = item.text() {
@@ -76,8 +96,15 @@ impl Editor {
         let Some(source) = item.text() else {
             return;
         };
+        self.paste_markdown(&source, cx);
+    }
+
+    fn paste_markdown(&mut self, source: &str, cx: &mut Context<Self>) {
+        if self.in_fence() {
+            return self.paste_literal(source, cx);
+        }
         let url = source.trim();
-        if markdown::is_url(url) {
+        if markdown::is_link(url) {
             return self.paste_url(url.to_string(), cx);
         }
         self.edit(EditKind::Structure, cx, |this| {
@@ -85,7 +112,8 @@ impl Editor {
             let before = this.doc.blocks.len();
             let head = this
                 .doc
-                .splice(removed, markdown::parse_with(&source, &this.marks));
+                .edit()
+                .splice(removed, markdown::parse_with(source, &this.marks));
             this.selection = Selection::at(head.clamp(&this.doc));
             vec![Delta::Spliced(Splice {
                 removed,
@@ -104,7 +132,7 @@ impl Editor {
     /// Put `text` in place of the selection as it stands, caret after it.
     pub(super) fn paste_literal(&mut self, text: &str, cx: &mut Context<Self>) {
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::plain(text));
+            let splice = this.doc.edit().replace(this.selection, Text::plain(text));
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
             vec![Delta::Spliced(splice)]
         });
@@ -127,7 +155,7 @@ impl Editor {
         let at = self.cursor();
         let alone = at.part == Part::Body && self.caret_text().is_some_and(Text::is_empty);
         self.edit(EditKind::Structure, cx, |this| {
-            let splice = this.doc.replace(this.selection, Text::link(&url));
+            let splice = this.doc.edit().replace(this.selection, Text::link(&url));
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
             vec![Delta::Spliced(splice)]
         });
@@ -166,12 +194,15 @@ impl Editor {
                         },
                     }],
                 };
-                let splice = this.doc.replace(Selection::new(pasted.at, end), text);
+                let splice = this
+                    .doc
+                    .edit()
+                    .replace(Selection::new(pasted.at, end), text);
                 this.selection = Selection::at(splice.caret.clamp(&this.doc));
                 vec![Delta::Spliced(splice)]
             }),
             Choice::Bookmark => self.turn_into(ix, card(pasted.url, Form::Auto), cx),
-            Choice::Embed => self.turn_into(ix, card(pasted.url, Form::Embed), cx),
+            Choice::Embed => self.turn_into(ix, card(pasted.url, Form::Embed(None)), cx),
             Choice::Image => self.turn_into(
                 ix,
                 BlockKind::Image {

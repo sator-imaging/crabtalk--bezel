@@ -1,4 +1,4 @@
-use gpui::{WindowBackgroundAppearance, hsla};
+use gpui::{WindowBackgroundAppearance, hsla, point, px};
 use theme::*;
 
 fn srgb_u8(c: [f32; 3]) -> [u8; 3] {
@@ -375,13 +375,13 @@ fn neutrals_are_achromatic() {
 fn hairlines_and_washes_flip_tone_with_appearance() {
     let _guard = lock_appearance();
     set_current_appearance(Appearance::Dark);
-    assert_eq!(hairline(0.1).l, 1.0, "dark hairlines are white");
+    assert!(hairline(0.1).l < 1.0, "dark hairlines are grey, not white");
     assert_eq!(ink(0.1).l, 1.0, "dark fills are white");
     assert_eq!(ink(0.1).a, 0.1, "dark alphas pass through untouched");
     assert_eq!(wash(0.14).l, 0.92, "dark washes are soft-white");
 
     set_current_appearance(Appearance::Light);
-    assert_eq!(hairline(0.1).l, 0.0, "light hairlines are black");
+    assert!(hairline(0.1).l > 0.0, "light hairlines are grey, not black");
     assert_eq!(ink(0.1).l, 0.0, "light fills are black");
     assert_eq!(wash(0.14).l, 0.10, "light washes are soft-black");
     // Fills keep their alpha; only hairlines are scaled.
@@ -478,7 +478,10 @@ fn both_palettes_define_a_frost_and_lights_runs_heavier() {
 /// compositor still gets one from `On`.
 #[test]
 fn auto_frosts_dark_alone_and_the_named_answers_stand() {
-    assert_eq!(Vibrancy::Auto.on(Appearance::Dark), frosted_window());
+    assert_eq!(
+        Vibrancy::Auto.on(Appearance::Dark),
+        behind_window_blending()
+    );
     assert!(!Vibrancy::Auto.on(Appearance::Light));
 
     for appearance in [Appearance::Dark, Appearance::Light] {
@@ -495,11 +498,11 @@ fn auto_frosts_dark_alone_and_the_named_answers_stand() {
 fn a_brand_asks_for_the_frost_its_palette_was_built_for() {
     assert_eq!(Brand::default().vibrancy, Vibrancy::Auto);
 
-    // And it reaches the installed palette: light opaque, dark frosted.
+    // And it reaches the installed palette: light opaque, dark translucent.
     let light = Theme::branded(&Brand::default(), Appearance::Light);
     assert!(!light.vibrancy, "light composites opaque");
     let dark = Theme::branded(&Brand::default(), Appearance::Dark);
-    assert_eq!(dark.vibrancy, frosted_window());
+    assert_eq!(dark.vibrancy, behind_window_blending());
 }
 
 /// An input plate has to read as *lifted* in both appearances. Dark does that
@@ -578,7 +581,7 @@ fn appearance_mirror_tracks_installed_theme() {
 /// backdrop; `Blurred` there is the accent API's acrylic at a zero tint, which
 /// leaves the desktop showing through as if nothing were applied.
 #[test]
-fn a_frosted_window_asks_for_the_backdrop_its_platform_has() {
+fn a_window_with_behind_window_blending_asks_for_the_backdrop_its_platform_has() {
     let mut theme = Theme::dark();
 
     theme.vibrancy = false;
@@ -608,7 +611,7 @@ fn a_card_frosts_on_the_renderer_and_a_window_on_the_compositor() {
     assert_eq!(Brand::default().glass, LENSED);
     if LENSED {
         assert!(
-            frosted_window(),
+            behind_window_blending(),
             "a lens implies a backdrop behind the window"
         );
     }
@@ -721,12 +724,180 @@ fn clear_glass_has_no_flat_tone() {
 }
 
 #[test]
-fn the_frame_shadow_stays_inside_the_client_inset() {
-    for shadow in frame_shadows() {
-        let reach = f32::from(shadow.blur_radius) + f32::from(shadow.spread_radius);
-        let (x, y) = (f32::from(shadow.offset.x), f32::from(shadow.offset.y));
-        for side in [reach + x, reach - x, reach + y, reach - y] {
-            assert!(side <= Theme::CLIENT_INSET, "{shadow:?} reaches {side}px");
+fn the_frame_shadow_reserves_half_the_client_inset_for_its_tail() {
+    let shadows = frame_shadows();
+    assert_eq!(shadows.len(), 1);
+    let shadow = &shadows[0];
+    assert_eq!(shadow.color, hsla(0.0, 0.0, 0.0, 0.4));
+    assert_eq!(shadow.offset, point(px(0.0), px(0.0)));
+    assert_eq!(shadow.blur_radius, px(Theme::CLIENT_INSET / 2.0));
+    assert_eq!(shadow.spread_radius, px(0.0));
+    assert!(!shadow.inset);
+}
+
+/// Slot 0 is "black" — the one slot whose job is to sit *at* the dark end of
+/// the scale, not to be readable text. It draws box edges and shaded blocks,
+/// so it gets the grey floor below rather than the text floor.
+const ANSI_BLACK: usize = 0;
+
+/// Every ANSI slot is readable on its own terminal background. The chromatic
+/// slots clear 3:1; the black/bright-black pair are structural greys and only
+/// have to separate from it — the dark palette puts bright black at 2.58:1.
+#[test]
+fn every_ansi_slot_is_legible_on_its_background() {
+    const MIN_TEXT: f32 = 3.0;
+    const MIN_GREY: f32 = 1.25;
+    for theme in [Theme::dark(), Theme::light()] {
+        for (ix, &color) in theme.terminal_ansi.iter().enumerate() {
+            let min = if ix % 8 == ANSI_BLACK {
+                MIN_GREY
+            } else {
+                MIN_TEXT
+            };
+            let ratio = contrast_ratio(color, theme.terminal_bg);
+            assert!(
+                ratio >= min,
+                "{:?} ANSI {ix} is {ratio:.2}:1, want {min}:1",
+                theme.appearance
+            );
         }
     }
+}
+
+/// "Bright" is *more* prominent in both appearances — darker on a light field.
+/// Bright black is the exception: the dim-text grey, lighter than black in
+/// both.
+#[test]
+fn bright_ansi_slots_gain_emphasis_in_both_appearances() {
+    for theme in [Theme::dark(), Theme::light()] {
+        let lum = |ix: usize| relative_luminance(theme.terminal_ansi[ix]);
+        for ix in 1..8 {
+            let brighter = lum(ix + 8) > lum(ix);
+            assert_eq!(
+                brighter,
+                theme.appearance.is_dark(),
+                "{:?} ANSI {ix}",
+                theme.appearance
+            );
+        }
+        assert!(lum(8) > lum(ANSI_BLACK));
+    }
+}
+
+#[test]
+fn a_family_variant_lays_its_tokens_over_the_shipped_palette() {
+    let family: ThemeFamily = serde_json::from_str(
+        r##"{
+            "name": "Test",
+            "dark": {
+                "bg": "#282828",
+                "syntax": { "keyword": "#fb4934" },
+                "terminal.ansi": { "red": "#cc241d" },
+                "nope": "#000000"
+            },
+            "light": {}
+        }"##,
+    )
+    .unwrap();
+    let mut theme = Theme::dark();
+    let unknown = family.dark.as_ref().unwrap().apply(&mut theme);
+    assert_eq!(unknown, ["nope"]);
+    assert_eq!(theme.bg, gpui::rgb(0x282828).into());
+    assert_eq!(theme.syntax.keyword, gpui::rgb(0xfb4934).into());
+    assert_eq!(theme.terminal_ansi[1], gpui::rgb(0xcc241d).into());
+    assert_eq!(theme.surface, Theme::dark().surface);
+    let light = family.theme(Appearance::Light).unwrap();
+    assert_eq!(light.bg, Theme::light().bg);
+    assert_eq!(light.family.as_deref(), Some("Test"));
+}
+
+#[test]
+fn a_family_may_have_one_variant_but_not_none() {
+    let dark_only: ThemeFamily =
+        serde_json::from_str(r##"{ "name": "Night", "dark": { "bg": "#000000" } }"##).unwrap();
+    assert!(dark_only.theme(Appearance::Dark).is_some());
+    assert!(dark_only.theme(Appearance::Light).is_none());
+    assert!(serde_json::from_str::<ThemeFamily>(r##"{ "name": "Empty" }"##).is_err());
+}
+
+#[test]
+fn a_seed_grows_a_variant_and_tokens_override_it() {
+    let family: ThemeFamily = serde_json::from_str(
+        r##"{
+            "name": "Seeded",
+            "dark": {
+                "seed": {
+                    "surface": "#111827",
+                    "ink": "#e4e4e7",
+                    "accent": "#ff5c5c",
+                    "removed": "#ff5c5c"
+                },
+                "caret": "#3b82f6"
+            }
+        }"##,
+    )
+    .unwrap();
+    let theme = family.theme(Appearance::Dark).unwrap();
+    let surface: gpui::Hsla = gpui::rgb(0x111827).into();
+    assert_eq!(theme.bg, surface);
+    assert_eq!(theme.accent, gpui::rgb(0xff5c5c).into());
+    assert_eq!(theme.diff_del, gpui::rgb(0xff5c5c).into());
+    assert_eq!(theme.caret, gpui::rgb(0x3b82f6).into());
+    assert_eq!(theme.diff_add, Theme::dark().diff_add);
+    // Raised surfaces step from the panel toward the text.
+    assert!(relative_luminance(theme.surface_raised) > relative_luminance(surface));
+    assert!(relative_luminance(theme.surface_raised) < relative_luminance(theme.text));
+    assert!(
+        serde_json::from_str::<ThemeFamily>(
+            r##"{ "name": "Typo", "dark": { "seed": { "surface": "#000000", "ink": "#ffffff", "accent": "#ff0000", "accnet": "#ff0000" } } }"##
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_brand_tint_leaves_a_family_palette_alone() {
+    let brand = Brand {
+        tint: Tint::new(257.417, 0.046),
+        ..Brand::default()
+    };
+    let family: ThemeFamily =
+        serde_json::from_str(r##"{ "name": "Grey", "dark": { "bg": "#202020" } }"##).unwrap();
+    let mut themed = family.theme(Appearance::Dark).unwrap();
+    brand.apply(&mut themed);
+    assert_eq!(themed.bg, gpui::rgb(0x202020).into());
+    let mut shipped = Theme::dark();
+    brand.apply(&mut shipped);
+    assert_ne!(shipped.bg, Theme::dark().bg);
+}
+
+#[test]
+fn an_oklab_mix_runs_from_one_end_to_the_other() {
+    let (black, white) = (grey(0), grey(255));
+    assert_eq!(mix_oklab(black, white, 0.0), black);
+    let end = mix_oklab(black, white, 1.0);
+    assert!((end.l - 1.0).abs() < 1e-3);
+    // Halfway in OKLab is oklch L 0.5, not sRGB 50%.
+    let mid = mix_oklab(black, white, 0.5);
+    assert!((lightness(mid) - 0.5).abs() < 1e-3);
+}
+
+#[test]
+fn token_names_are_unique() {
+    let mut theme = Theme::dark();
+    let names: Vec<&str> = theme
+        .tokens_mut()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+    assert_eq!(names.len(), unique.len());
+}
+
+#[test]
+fn bundled_families_parse() {
+    let families = ThemeFamily::bundled();
+    assert_eq!(families.len(), 27);
+    let gruvbox = ThemeFamily::named("gruvbox").expect("gruvbox is bundled");
+    assert!(gruvbox.theme(Appearance::Dark).is_some());
 }

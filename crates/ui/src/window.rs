@@ -1,5 +1,6 @@
 //! [`frame`] — the border, corners, shadow and resize edges of a window the
-//! system does not decorate.
+//! system does not decorate. [`content`] — the card an app's main view sits
+//! on, inside that window.
 //!
 //! `Window::window_decorations` answers which of the two is in force, and it
 //! is not a target: GNOME has never implemented `xdg-decoration`, so a Wayland
@@ -16,8 +17,8 @@
 //! ```
 
 use gpui::{
-    App, Bounds, CursorStyle, Decorations, Div, HitboxBehavior, IntoElement, MouseButton, Pixels,
-    Point, ResizeEdge, Size, Window, canvas, div, point, prelude::*, px, size,
+    App, Bounds, CursorStyle, Decorations, Div, HitboxBehavior, Hsla, IntoElement, MouseButton,
+    Pixels, Point, ResizeEdge, Size, Tiling, Window, canvas, div, point, prelude::*, px, size,
 };
 
 use theme::Theme;
@@ -34,10 +35,16 @@ use theme::Theme;
 /// band in the wrong place.
 ///
 /// An edge `tiling` reports flush — against a screen edge, or another window
-/// in a tile — keeps its square corner and gives up its band.
+/// in a tile — keeps its square corner and gives up its band. A maximized
+/// window counts as flush on every edge: X11 window managers do not always
+/// report tiling for one.
 pub fn frame(child: impl IntoElement, window: &mut Window, cx: &App) -> Div {
     let Decorations::Client { tiling } = window.window_decorations() else {
         return div().size_full().child(child);
+    };
+    let tiling = match window.is_maximized() {
+        true => Tiling::tiled(),
+        false => tiling,
     };
 
     let inset = px(Theme::CLIENT_INSET);
@@ -51,9 +58,13 @@ pub fn frame(child: impl IntoElement, window: &mut Window, cx: &App) -> Div {
             canvas(
                 move |_, window, _| {
                     let size = window.window_bounds().get_bounds().size;
-                    bands(size, inset).map(|(edge, band)| {
-                        (edge, window.insert_hitbox(band, HitboxBehavior::Normal))
-                    })
+                    bands(size, inset)
+                        .into_iter()
+                        .filter(|(edge, _)| live(*edge, tiling))
+                        .map(|(edge, band)| {
+                            (edge, window.insert_hitbox(band, HitboxBehavior::Normal))
+                        })
+                        .collect::<Vec<_>>()
                 },
                 |_, bands, window, _| {
                     for (edge, band) in bands {
@@ -70,7 +81,9 @@ pub fn frame(child: impl IntoElement, window: &mut Window, cx: &App) -> Div {
         .when(!tiling.right, |frame| frame.pr(inset))
         .on_mouse_down(MouseButton::Left, move |event, window, _| {
             let size = window.window_bounds().get_bounds().size;
-            if let Some(edge) = resize_edge(event.position, inset, size) {
+            if let Some(edge) =
+                resize_edge(event.position, inset, size).filter(|edge| live(*edge, tiling))
+            {
                 window.start_window_resize(edge);
             }
         })
@@ -102,6 +115,62 @@ pub fn frame(child: impl IntoElement, window: &mut Window, cx: &App) -> Div {
                 })
                 .child(child),
         )
+}
+
+/// The element an app's main view is drawn in.
+///
+/// Floating, it is a card on the window's chrome, [`Theme::sidebar_bg`],
+/// which its parent paints: [`Theme::panel_radius`] corners, a hairline border
+/// and [`Theme::content_bg`] over the chrome. An opaque card casts
+/// [`theme::content_shadows`]; under [`Theme::vibrancy`] it casts none, since a
+/// shadow shows through a translucent fill. Flat, it is a plain
+/// [`Theme::window_bg`] fill with none of those.
+///
+/// The card has no margin. The caller sizes and places it: it is handed back
+/// unsized, as a flex row or column item would want it, and the space around
+/// it — [`Theme::CONTENT_INSET`] off the window's edge and between two cards —
+/// is the parent's padding and gaps.
+pub fn content(floating: bool, cx: &App) -> Div {
+    let theme = Theme::of(cx);
+    match floating {
+        true => card(theme.content_bg(), theme).when(!theme.vibrancy, |card| {
+            card.shadow(theme::content_shadows())
+        }),
+        false => div().bg(theme.window_bg()),
+    }
+}
+
+/// A floating [`content`] card sitting back, beside a raised one: the same
+/// corners and border, [`Theme::content_resting_bg`] over the chrome, and no
+/// shadow.
+pub fn resting(cx: &App) -> Div {
+    let theme = Theme::of(cx);
+    card(theme.content_resting_bg(), theme)
+}
+
+/// The one colour [`content`] shows, chrome included, for an element inside
+/// it that has to cover what is under it in the same colour.
+pub fn content_fill(floating: bool, theme: &Theme) -> Hsla {
+    match floating {
+        true => theme::over(theme.content_bg(), theme.sidebar_bg()),
+        false => theme.window_bg(),
+    }
+}
+
+/// [`content_fill`] for a [`resting`] card.
+pub fn resting_fill(theme: &Theme) -> Hsla {
+    theme::over(theme.content_resting_bg(), theme.sidebar_bg())
+}
+
+fn card(fill: Hsla, theme: &Theme) -> Div {
+    div()
+        .bg(fill)
+        .rounded(px(Theme::panel_radius()))
+        .border_1()
+        .border_color(theme.border)
+        // Without this the child's own background paints over the corners the
+        // border rounds.
+        .overflow_hidden()
 }
 
 /// Which edge a press at `pos` resizes, or `None` for a press on the content.
@@ -148,6 +217,21 @@ fn bands(window: Size<Pixels>, inset: Pixels) -> [(ResizeEdge, Bounds<Pixels>); 
         (ResizeEdge::Left, band(zero, inset, inset, span_y)),
         (ResizeEdge::Right, band(far_x, inset, inset, span_y)),
     ]
+}
+
+/// Whether `edge` resizes: none of the sides it touches is flush.
+pub fn live(edge: ResizeEdge, tiling: Tiling) -> bool {
+    let (top, bottom, left, right) = match edge {
+        ResizeEdge::Top => (true, false, false, false),
+        ResizeEdge::Bottom => (false, true, false, false),
+        ResizeEdge::Left => (false, false, true, false),
+        ResizeEdge::Right => (false, false, false, true),
+        ResizeEdge::TopLeft => (true, false, true, false),
+        ResizeEdge::TopRight => (true, false, false, true),
+        ResizeEdge::BottomLeft => (false, true, true, false),
+        ResizeEdge::BottomRight => (false, true, false, true),
+    };
+    !(top && tiling.top || bottom && tiling.bottom || left && tiling.left || right && tiling.right)
 }
 
 /// The pointer an edge shows.

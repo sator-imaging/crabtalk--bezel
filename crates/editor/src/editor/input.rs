@@ -3,10 +3,13 @@
 use std::ops::Range;
 
 use gpui::{Context, EntityInputHandler, UTF16Selection, Window};
-use markdown::{Cursor, Selection};
+use markdown::{Affinity, Cursor, Selection};
 use ui::input::{composition_selection, offset_to_utf16, range_from_utf16, range_to_utf16};
 
-use crate::editor::Editor;
+use crate::{
+    document::Change,
+    editor::{Editor, Reveal},
+};
 
 /// Typed text and IME arrive here. Offsets are within the caret's block, which
 /// is the unit the platform is told about — a block is a paragraph's worth of
@@ -72,7 +75,7 @@ impl EntityInputHandler for Editor {
         // event to this handler rather than to the `Paste` action. Typing
         // cannot reach here — a URL typed by hand arrives a character at a
         // time, and none of those characters is a URL.
-        if range.is_none() && self.marked.is_none() && markdown::is_url(text.trim()) {
+        if range.is_none() && self.marked.is_none() && markdown::is_link(text.trim()) {
             return self.paste_url(text.trim().to_string(), cx);
         }
         // The platform's range is within the caret's own text, so it becomes a
@@ -116,7 +119,9 @@ impl EntityInputHandler for Editor {
             .or_else(|| self.marked.clone())
         {
             let at = self.cursor();
-            self.doc.edit_at(at, |body| body.remove(range.clone()));
+            self.doc
+                .edit()
+                .edit_at(at, |body| body.remove(range.clone()));
             self.place(Cursor {
                 offset: range.start,
                 ..at
@@ -127,7 +132,7 @@ impl EntityInputHandler for Editor {
         // pull the text out from under the IME.
         let at = self.cursor();
         let start = at.offset;
-        self.doc.edit_at(at, |body| body.insert(start, text));
+        self.doc.edit().edit_at(at, |body| body.insert(start, text));
         self.marked = (!text.is_empty()).then_some(start..start + text.len());
         let selected = composition_selection(text, start, marked);
         self.selection = Selection::new(
@@ -140,8 +145,9 @@ impl EntityInputHandler for Editor {
                 ..at
             },
         );
-        self.reveal = true;
+        self.reveal = Some(Reveal::Nearest);
         self.caret_moved();
+        self.publish(Change::Composing, cx);
         cx.notify();
     }
 
@@ -160,13 +166,16 @@ impl EntityInputHandler for Editor {
             offset: range.start,
             ..at
         };
-        let (origin, line_height) = self.layouts.position(start)?;
+        let (origin, line_height) = self.layouts.position(start, Affinity::Downstream)?;
         let end = self
             .layouts
-            .position(Cursor {
-                offset: range.end,
-                ..at
-            })
+            .position(
+                Cursor {
+                    offset: range.end,
+                    ..at
+                },
+                Affinity::Upstream,
+            )
             .map(|(point, _)| point)
             .filter(|point| point.y == origin.y);
         let width = end.map_or(gpui::px(0.0), |point| point.x - origin.x);
@@ -179,7 +188,7 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let hit = self.layouts.hit(point)?;
+        let (hit, _) = self.layouts.hit(point)?;
         let at = self.cursor();
         (hit.block == at.block && hit.part == at.part)
             .then_some(offset_to_utf16(&self.caret_text()?.text, hit.offset))

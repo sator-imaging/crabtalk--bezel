@@ -6,19 +6,22 @@
 //! composed exactly once, so the browser is never out of date with the library
 //! it documents.
 
+use editor::AppExt as _;
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Empty, Entity, KeyBinding, SharedString, Window,
     actions, div, point, prelude::*, px, relative,
 };
+use markdown::AppExt as _;
 use motion::{AppExt as _, Fade, Painter};
 use rail::{Rail, Selected};
 use std::{cell::Cell, collections::HashSet, rc::Rc};
 use theme::{
     ControlSize, Glass, Material, Sizing, SurfaceSpec, SurfaceStyle, TextStyle, Theme, Typeset,
-    appearance::{self, AppearanceMode},
+    appearance::AppearanceMode,
 };
 use ui::{
     combobox::{self, Combobox},
+    context_menu::{ContextMenu, Place},
     control_bar::{self, Shape as ControlBarShape},
     date::{self, Calendar, Date},
     floating::{self, Floating},
@@ -29,6 +32,7 @@ use ui::{
     keys, list, loaders,
     menu::Item,
     menubar::{self, Menu, Menubar, MenubarEvent},
+    multi_select::{self, MultiSelect, MultiSelectEvent},
     pagination,
     palette::{self, CommandPalette, PaletteEvent},
     pending::PendingKeys,
@@ -63,6 +67,11 @@ actions!(
 /// a browser tab has no window to quit.
 const APP_MENUBAR: bool = !cfg!(any(target_os = "macos", target_family = "wasm"));
 
+/// Whether the nav strip runs over the rail. It holds the traffic lights on
+/// macOS and the caption controls and menus elsewhere; a browser tab has
+/// neither, and its rail runs to the top.
+const NAV_OVER_RAIL: bool = !cfg!(target_family = "wasm");
+
 /// Every keymap this view needs, in one call.
 ///
 /// Two entry points open it — a native window and a browser tab — and a list
@@ -70,31 +79,34 @@ const APP_MENUBAR: bool = !cfg!(any(target_os = "macos", target_family = "wasm")
 /// bindings were installed natively and missing on the web, so typing worked in
 /// the browser and Backspace did not.
 pub fn init(cx: &mut App) {
-    markdown::set_highlighter(cx, highlight::spans, highlight::languages());
-    markdown::set_link_preview(cx, preview::of);
-    markdown::set_block_renderer(cx, blocks::render);
+    cx.set_highlighter(highlight::spans, highlight::languages());
+    cx.set_links::<preview::Links>();
+    cx.set_block_renderer(|fence, window, cx| {
+        blocks::render(fence.language, fence.code, fence.height, window, cx)
+    });
     // The dialect this gallery reads and writes: two marks CommonMark has no
     // spelling for, registered rather than waited on. See the Ribbon page.
-    markdown::set_marks(
-        cx,
+    cx.set_marks(
         markdown::Marks::new()
             .with("highlight", "==")
             .with("underline", "++"),
     );
-    markdown::set_mark_paint(cx, patterns::ribbon::paint);
-    editor::set_image_store(cx, store::of());
+    cx.set_mark_paint(pages::editor::ribbon::paint);
+    cx.set_image_store(store::of());
     input::init(cx);
     editor::init(cx);
     canvas::init(cx);
     palette::init(cx);
     combobox::init(cx);
+    multi_select::init(cx);
+    ui::menu::init(cx);
     date::init(cx);
     focus::init(cx);
     menubar::init(cx);
     tree::init(cx);
-    // A pattern is an app: the composer page binds its own keys.
-    patterns::agent::init(cx);
-    patterns::browser::init(cx);
+    // A page is an app: the composer and the browser bind their own keys.
+    pages::agent::activity::init(cx);
+    pages::agent::browser::init(cx);
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-k", OpenPalette, None),
@@ -112,9 +124,10 @@ pub fn init(cx: &mut App) {
 pub mod highlight;
 
 pub mod brand;
-pub mod patterns;
+pub mod pages;
 pub mod preview;
 mod rail;
+pub mod samples;
 pub mod store;
 
 mod catalog;
@@ -124,8 +137,7 @@ mod sections;
 
 pub use catalog::*;
 pub use fixtures::*;
-use sections::*;
-use sections::{controls, data, foundations, material, navigation, overlays};
+use sections::{controls, data, foundations, material, navigation, overlays, *};
 
 /// The rail's padding — the grid its rows, its footer and the traffic lights
 /// all sit on.
@@ -147,7 +159,7 @@ const COLUMN_WIDTH: f32 = 420.0;
 /// moving either width moves the breakpoint with it.
 const COMPACT_BELOW: f32 = RAIL_WIDTH + PANE_PAD * 2.0 + COLUMN_WIDTH;
 
-/// The floor under a pattern's canvas once it is being panned rather than
+/// The floor under a full-bleed page's canvas once it is being panned rather than
 /// fitted: the narrowest pane the two-column layout ever hands one.
 const CANVAS_MIN: f32 = COMPACT_BELOW - RAIL_WIDTH;
 
@@ -182,14 +194,24 @@ const COMPACT_NAV_PAD: f32 = if cfg!(target_os = "macos") {
     RAIL_PAD
 };
 
+/// Which of the context menu page's menus is up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Demo {
+    /// At a right press anywhere in the window.
+    Pointer,
+    /// Under the page's `···`.
+    Button,
+}
+
 pub struct Gallery {
     /// Mounted only while open — a palette that lingers keeps a stale query.
     palette: Option<Entity<CommandPalette>>,
     last_command: Option<SharedString>,
     /// Built on the first render, which is the first time there is a window.
     pending: Option<Entity<PendingKeys>>,
-    /// Right-click menu, anchored at the click position.
-    context_menu: popover::Popup<gpui::Point<gpui::Pixels>>,
+    /// The context menu page's two menus: one at a right press anywhere,
+    /// one under its `···`.
+    context_menu: ContextMenu<Self, Demo>,
     /// The menubar demo, which holds which menu is down.
     menubar: Entity<Menubar>,
     /// The app's own menus, mounted in the nav where the platform has no menu
@@ -248,13 +270,19 @@ pub struct Gallery {
     overlays: overlays::State,
     material: material::State,
     foundations: foundations::State,
-    patterns: patterns::State,
+    agent: pages::agent::State,
+    editor: pages::editor::State,
+    diagrams: pages::diagrams::State,
 }
 
 impl Gallery {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        // Opened on the same page the fields below start at.
-        let rail = cx.new(|cx| Rail::new(2, TABS[2].home, cx));
+        // Opened on the Agent tab, the same page the fields below start at.
+        let opening = TABS
+            .iter()
+            .position(|tab| tab.title == "Agent")
+            .unwrap_or(0);
+        let rail = cx.new(|cx| Rail::new(opening, TABS[opening].home, cx));
         cx.subscribe(&rail, |view, _, selected: &Selected, cx| {
             view.open(view.tab, selected.0, cx);
             // A drawer that stays up over the page it just opened is a drawer
@@ -308,7 +336,7 @@ impl Gallery {
             palette: None,
             last_command: None,
             pending: None,
-            context_menu: popover::Popup::default(),
+            context_menu: ContextMenu::default(),
             sheet: popover::Popup::default(),
             drawer: popover::Popup::default(),
             focus_handle: cx.focus_handle(),
@@ -318,7 +346,7 @@ impl Gallery {
             pane_scroll: gpui::ScrollHandle::new(),
             pane_bar: TransientState::new(Painter::of(cx)),
             last_pressed: None,
-            tab: 2,
+            tab: opening,
             selected: TABS.iter().map(|tab| tab.home).collect(),
             dialog: popover::Popup::default(),
             stats: cx.new(Stats::new),
@@ -332,7 +360,9 @@ impl Gallery {
             overlays: overlays::State::new(cx),
             material: material::State::new(cx),
             foundations: foundations::State::new(cx),
-            patterns: patterns::State::new(cx),
+            agent: pages::agent::State::new(cx),
+            editor: pages::editor::State::new(cx),
+            diagrams: pages::diagrams::State::new(cx),
         }
     }
 
@@ -380,16 +410,20 @@ impl Gallery {
         gallery
     }
 
-    /// Point the embed at another example of the section it is already on —
-    /// what a doc page sends as the reader scrolls from snippet to snippet.
-    /// `None` widens it back to the whole page.
-    pub fn show_example(&mut self, example: Option<&str>, cx: &mut Context<Self>) {
+    /// Point the embed at a section, and at one of its examples or, with
+    /// `None`, the whole page — what a doc page sends as the reader moves
+    /// between pages and snippets. A key not in the catalog changes nothing.
+    pub fn show(&mut self, key: &str, example: Option<&str>, cx: &mut Context<Self>) {
+        let Some(tab) = tab_of(key) else {
+            return;
+        };
+        let key = section_at(key).expect("tab_of matched").key;
         let example = example.map(SharedString::from);
-        if self.example == example {
+        if self.tab == tab && self.selected[tab] == key && self.example == example {
             return;
         }
         self.example = example;
-        cx.notify();
+        self.open(tab, key, cx);
     }
 
     /// The gallery's own focus handle — what the window focuses on launch.
@@ -479,10 +513,7 @@ impl Gallery {
     }
 
     fn close_context_menu(&mut self, cx: &mut Context<Self>) {
-        if self.context_menu.begin_close() {
-            popover::reap_popup(self, cx, |view: &mut Self| &mut view.context_menu);
-        }
-        cx.notify();
+        ContextMenu::close(self, |view| &mut view.context_menu, cx);
     }
 
     /// Straight off, because `popover::modal` has no exit to play — unlike the

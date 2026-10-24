@@ -29,7 +29,14 @@ use gpui::{
 };
 use icons::Icon;
 use motion::{self as motion, AnimationExt as _, Fade, PULSE, Painter};
-use theme::{TextStyle, Theme, Typeset, hairline, ink};
+use theme::{TextStyle, Theme, Typeset, ink};
+
+/// The deferred priority a modal and a sheet paint at.
+const MODAL_LAYER: usize = 2;
+
+/// The deferred priority a menu and its submenus paint at: over a modal, so a
+/// menu opened inside one shows.
+const MENU_LAYER: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
@@ -375,11 +382,6 @@ pub fn trigger_press_matching<V: 'static, T: 'static, E: gpui::InteractiveElemen
 // Elements
 // ---------------------------------------------------------------------------
 
-/// The floating-menu surface: `rounded-xl border border-white/[0.1] p-1` over
-/// whichever look [`Theme::menu_style`] names — the hairline and the baked-in
-/// shadow are the card's, and the surface under it paints everything inside
-/// them. Opaque platforms keep the near-opaque tone the reference composites
-/// to on the dark panels (~#161616).
 /// The inner inset of a [`popover_card`], and so the amount [`menu_row`]'s
 /// corners come in by. Named because two things read it: the card's padding and
 /// its rows' radius. Change it and the rows follow.
@@ -388,6 +390,10 @@ pub(crate) const MENU_PAD: f32 = 4.0;
 /// The gap a floating layer keeps from the window edge once it has run out of
 /// room and is snapped back inside it.
 pub(crate) const SNAP: f32 = 8.0;
+
+/// How far a [`menu_row`]'s text sits in from its own edge. Content that is
+/// not a row lines up with the rows' text by insetting this much.
+pub const MENU_ROW_INSET: f32 = 8.0;
 
 /// A [`menu_row`]'s padding above and below its line box. Named because a
 /// list that caps itself at a row count has to know how tall a row is.
@@ -399,6 +405,8 @@ pub(crate) fn menu_row_height() -> f32 {
     TextStyle::Body.painted_line_height() + 2.0 * MENU_ROW_PAD_Y
 }
 
+/// The floating-menu card. With `theme.glass` on it paints contents only, and
+/// the fill, hairline and shadow are the surface's it is mounted on.
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .rounded(px(Theme::surface_radius()))
@@ -414,7 +422,7 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
     } else {
         card.bg(theme.surface_overlay)
             .border_1()
-            .border_color(hairline(0.10))
+            .border_color(theme.border)
             .shadow_lg()
     }
 }

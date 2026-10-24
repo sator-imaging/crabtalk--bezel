@@ -1,15 +1,27 @@
 //! Shaping and painting: runs, rows, selection and caret.
 
 use super::*;
+use crate::AppExt as _;
 
 /// What gets painted, and whether it is the placeholder — which is the only
 /// reason the colour differs.
-pub(super) fn display_text(field: &TextField) -> (SharedString, bool) {
+pub(super) fn display_text(field: &TextField) -> (chip::Chipped, bool) {
     if field.content.is_empty() {
-        (field.placeholder.clone(), true)
+        (chip::Chipped::plain(field.placeholder.clone()), true)
     } else {
-        (field.content.clone(), false)
+        (chip::chipped(&field.content, &field.chips), false)
     }
+}
+
+/// `runs` with each chip in `chipped` painted: the glyph's slot empty, the
+/// title underlined, both in `color` whatever the spans said.
+fn chip_runs(mut runs: Vec<TextRun>, chipped: &chip::Chipped, color: gpui::Hsla) -> Vec<TextRun> {
+    for ((slot, _), title) in chipped.slots.iter().zip(&chipped.titles) {
+        runs = caret::recoloured(runs, &(slot.start..title.end), color);
+        runs = caret::recoloured(runs, slot, gpui::transparent_black());
+        runs = underlined(runs, title);
+    }
+    runs
 }
 
 /// One run per span, the text between them in the field's own colour.
@@ -220,7 +232,7 @@ impl Render for TextField {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The only place the blink starts: `caret_moved` drops the task, so the
         // next render brings it back in phase, solid beat first.
-        if self.focus_handle.is_focused(_window) && caret_blink(cx) {
+        if self.focus_handle.is_focused(_window) && cx.caret_blink() {
             if self.blink.is_none() {
                 self.start_blink(cx);
             }
@@ -272,10 +284,12 @@ impl Render for TextField {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
+            .when(self.shape == Shape::Fill, |field| field.h_full())
             .when(self.frame, |field| {
                 field
                     .px(px(10.0))
@@ -283,7 +297,7 @@ impl Render for TextField {
                     .rounded(px(Theme::button_radius()))
                     .bg(theme.input_bg)
                     .border_1()
-                    .border_color(if self.focus_handle.is_focused(_window) {
+                    .border_color(if self.focus_handle.contains_focused(_window, cx) {
                         theme.ring
                     } else {
                         theme.border
@@ -294,6 +308,7 @@ impl Render for TextField {
             .line_height(px(self.metrics.line_height()))
             .text_color(theme.text)
             .child(TextFieldElement { field: cx.entity() })
+            .children(self.edit_menu(_window, cx))
     }
 }
 
@@ -306,13 +321,30 @@ pub(super) struct TextFieldElement {
 
 pub(super) struct FieldPrepaint {
     lines: Vec<WrappedLine>,
+    shown: Shown,
+    /// Each chip's glyph and the slot it is painted in, in `lines`' offsets.
+    glyphs: Vec<(Range<usize>, icons::Icon)>,
+    glyph_color: gpui::Hsla,
+    font_size: Pixels,
     /// Top-left of the text, which is the box moved up by the scroll offset.
     origin: Point<Pixels>,
     cursor: Option<PaintQuad>,
-    /// One quad per visual row each match covers.
-    matches: Vec<PaintQuad>,
-    /// One quad per visual row the selection covers.
-    selection: Vec<PaintQuad>,
+    covered: Option<Covered>,
+    /// One quad per visual row of each of the field's [`overdraw::Layers`],
+    /// in the order they are painted.
+    under: Vec<PaintQuad>,
+    /// The text drawn again over the selection and the matches.
+    overdraws: Vec<overdraw::Overdraw>,
+}
+
+/// The glyph a solid block caret covers, for [`caret::paint_covered`].
+struct Covered {
+    layout: std::sync::Arc<gpui::LineLayout>,
+    /// Within `layout`'s line.
+    range: Range<usize>,
+    /// The top left of its slot.
+    at: Point<Pixels>,
+    color: gpui::Hsla,
 }
 
 impl IntoElement for TextFieldElement {
@@ -359,16 +391,22 @@ impl Element for TextFieldElement {
                 style.size.height = (line_height * rows.max(1) as f32).into();
                 return (window.request_layout(style, [], cx), ());
             }
+            Shape::Fill => {
+                style.size.height = relative(1.).into();
+                return (window.request_layout(style, [], cx), ());
+            }
             // Growing needs the row count, and the row count needs shaping at
             // the width layout is still deciding — which is exactly what a
             // measured layout is for.
             Shape::Grow { min, max } => (min.max(1), max.max(min.max(1))),
         };
 
-        let text = display_text(field).0;
+        let text = display_text(field).0.text;
+        // Measuring runs after the element's text style is popped, where the
+        // window reports gpui's default font instead.
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
         let id = window.request_measured_layout(style, move |known, available, window, _cx| {
-            let text_style = window.text_style();
-            let font_size = text_style.font_size.to_pixels(window.rem_size());
             // Prefer the width layout has already settled on. Taffy also probes
             // with min/max-content, where there is no width to wrap against —
             // and counting rows off unwrapped text under-reports them, which
@@ -414,10 +452,13 @@ impl Element for TextFieldElement {
     ) -> FieldPrepaint {
         let theme = Theme::of(cx).clone();
         let field = self.field.read(cx);
-        let selected_range = field.selected_range.clone();
-        let cursor = field.cursor_offset();
+        let (chipped, is_placeholder) = display_text(field);
+        // Everything from here on is in the offsets of the text painted.
+        let shown = chipped.shown.clone();
+        let selected_range = shown.range(&field.selected_range);
+        let cursor = shown.at(field.cursor_offset());
         let shape = field.shape;
-        let marked_range = field.marked_range.clone();
+        let marked_range = field.marked_range.as_ref().map(|range| shown.range(range));
         let matches: Vec<_> = field
             .matches
             .iter()
@@ -426,13 +467,18 @@ impl Element for TextFieldElement {
                     && field.content.is_char_boundary(range.start)
                     && field.content.is_char_boundary(range.end)
             })
-            .cloned()
+            .map(|range| shown.range(range))
             .collect();
         let scrolled = field.scroll;
-        let follow_caret = field.follow_caret;
+        let caret_shape = cx.caret_shape();
+        let caret_height = cx.caret_height();
+        // A single line out of focus shows its start, wherever its caret is.
+        let at_start = !shape.is_multiline() && !field.focus_handle.contains_focused(window, cx);
+        let follow_caret =
+            !at_start && (field.follow_caret || caret_shape != field.last_caret_shape);
         let style = window.text_style();
 
-        let (text, is_placeholder) = display_text(field);
+        let text = chipped.text.clone();
         let text_color = if is_placeholder {
             theme.text_faint
         } else {
@@ -453,11 +499,37 @@ impl Element for TextFieldElement {
         let runs = if is_placeholder {
             vec![run]
         } else {
-            coloured(&text, &field.spans, &run, &theme.syntax)
+            let spans: Vec<_> = field
+                .spans
+                .iter()
+                .map(|(range, kind)| (shown.range(range), *kind))
+                .collect();
+            chip_runs(
+                coloured(&text, &spans, &run, &theme.syntax),
+                &chipped,
+                text_color,
+            )
         };
         let runs = match marked_range.as_ref() {
             Some(marked) => underlined(runs, marked),
             None => runs,
+        };
+        let match_wash = theme.warning.opacity(0.25);
+        let focused = field.focus_handle.contains_focused(window, cx);
+        let mut layers = overdraw::Layers::new();
+        if !is_placeholder {
+            for range in matches.iter() {
+                layers = layers.wash(range.clone(), match_wash, ());
+            }
+        }
+        // Shown while focus is in the field or its menu, kept for when it
+        // comes back.
+        if focused && !selected_range.is_empty() {
+            layers = layers.select(selected_range.clone(), theme.selection, ());
+        }
+        let overdraws = match is_placeholder {
+            true => Vec::new(),
+            false => overdraw::overdraws(&runs, theme.bg, &layers),
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
@@ -467,7 +539,7 @@ impl Element for TextFieldElement {
         let wrap_width = shape.is_multiline().then_some(bounds.size.width);
         let lines = window
             .text_system()
-            .shape_text(text, font_size, &runs, wrap_width, None)
+            .shape_text(text.clone(), font_size, &runs, wrap_width, None)
             .map(|lines| lines.into_vec())
             .unwrap_or_default();
 
@@ -475,14 +547,49 @@ impl Element for TextFieldElement {
         // measured against shrinks under it — delete the last line while parked
         // at the bottom and an unclamped offset leaves the box showing nothing.
         //
-        // Only one axis is ever live. Wrapped lines are shaped to the box width,
-        // so `max.x` is zero for a multi-line field; a single line is one row
-        // tall, so `max.y` is zero for a single-line one. Neither needs asking
-        // which shape it is.
+        // A wide caret needs trailing room even at the end of the longest row.
+        // Keep the bar's existing scroll extent unchanged.
         let content_height: Pixels = lines.iter().map(|l| l.size(line_height).height).sum();
         let content_width = lines.iter().map(|l| l.width()).fold(px(0.), Pixels::max);
+        // The slot a wide caret takes where no character follows it — the end
+        // of the text, a soft-wrap boundary: the font's `ch` width.
+        let slot = (caret_shape != CaretShape::Bar)
+            .then(|| caret::zero_width(style.font(), font_size, window));
+        // A placeholder is not text: over it the caret takes the empty slot.
+        let follows = (!is_placeholder)
+            .then(|| {
+                lines_from(&lines)
+                    .find_map(|(start, line)| {
+                        (cursor <= start + line.len()).then(|| {
+                            caret::character_advance(line, &line.text, cursor.saturating_sub(start))
+                        })
+                    })
+                    .flatten()
+            })
+            .flatten();
+        let advance = slot.map(|slot| follows.unwrap_or(slot));
+        let hollow = !window.is_window_active();
+        let caret_width = caret_shape
+            .quad(
+                Bounds::new(
+                    gpui::point(px(0.), px(0.)),
+                    gpui::size(CARET_WIDTH, font_size),
+                ),
+                line_height,
+                caret_height,
+                advance.unwrap_or_default(),
+                theme.caret,
+                hollow,
+            )
+            .bounds
+            .size
+            .width;
+        // A field that wraps never scrolls sideways.
         let max = gpui::point(
-            (content_width - bounds.size.width).max(px(0.)),
+            match shape.is_multiline() {
+                true => px(0.),
+                false => (content_width + slot.unwrap_or_default() - bounds.size.width).max(px(0.)),
+            },
             (content_height - bounds.size.height).max(px(0.)),
         );
         let mut scroll = gpui::point(
@@ -499,68 +606,78 @@ impl Element for TextFieldElement {
             // that has to clear the right edge — not the character before it.
             if at.x < scroll.x {
                 scroll.x = at.x;
-            } else if at.x + CARET_WIDTH > scroll.x + bounds.size.width {
-                scroll.x = at.x + CARET_WIDTH - bounds.size.width;
+            } else if at.x + caret_width > scroll.x + bounds.size.width {
+                scroll.x = at.x + caret_width - bounds.size.width;
             }
             scroll.x = scroll.x.clamp(px(0.), max.x);
             scroll.y = scroll.y.clamp(px(0.), max.y);
         }
+        if at_start {
+            scroll.x = px(0.);
+        }
         self.field.update(cx, |field, _| {
             field.scroll = scroll;
             field.follow_caret = false;
+            field.last_caret_shape = caret_shape;
         });
         let origin = bounds.origin - scroll;
 
-        let matches = if is_placeholder {
-            Vec::new()
-        } else {
-            matches
-                .iter()
-                .flat_map(|range| selection_rows(&lines, range, line_height))
-                .map(|rect| {
-                    fill(
-                        Bounds::new(origin + rect.origin, rect.size),
-                        theme.warning.opacity(0.25),
-                    )
-                })
-                .collect()
-        };
+        let under = layers
+            .painted()
+            .flat_map(|(range, color, _)| {
+                selection_rows(&lines, range, line_height)
+                    .into_iter()
+                    .map(move |rect| fill(Bounds::new(origin + rect.origin, rect.size), color))
+            })
+            .collect();
 
-        let (selection, cursor) = if selected_range.is_empty() {
+        let caret_shown = caret_shape.shown(!hollow, crate::input::caret::inactive_caret(cx));
+        let covered =
+            (selected_range.is_empty() && follows.is_some() && caret_shape.cuts_out(hollow))
+                .then(|| {
+                    let (start, line) =
+                        lines_from(&lines).find(|(start, line)| cursor <= start + line.len())?;
+                    let at = position_for_offset(&lines, cursor, line_height)?;
+                    Some(Covered {
+                        layout: line.unwrapped_layout.clone(),
+                        range: cursor - start..next_boundary(&text, cursor) - start,
+                        at: origin + at,
+                        color: caret::cover(&runs, cursor, theme.bg, &layers, theme.caret),
+                    })
+                })
+                .flatten();
+        let cursor = if selected_range.is_empty() {
             let at = position_for_offset(&lines, cursor, line_height).unwrap_or_default();
-            (
-                Vec::new(),
-                Some(fill(
+            caret_shown.then(|| {
+                caret_shape.quad(
                     // The font's size rather than the line's: leading is not
-                    // the caret's to fill.
+                    // a bar's or an underline's to fill. A block fills it.
                     Bounds::new(
                         origin + at + gpui::point(px(0.), (line_height - font_size) / 2.),
                         gpui::size(CARET_WIDTH, font_size),
                     ),
+                    line_height,
+                    caret_height,
+                    advance.unwrap_or_default(),
                     theme.caret,
-                )),
-            )
+                    hollow,
+                )
+            })
         } else {
-            (
-                selection_rows(&lines, &selected_range, line_height)
-                    .into_iter()
-                    .map(|rect| {
-                        fill(
-                            Bounds::new(origin + rect.origin, rect.size),
-                            theme.selection,
-                        )
-                    })
-                    .collect(),
-                None,
-            )
+            None
         };
 
         FieldPrepaint {
             lines,
+            shown,
+            glyphs: chipped.slots,
+            glyph_color: theme.text_muted,
+            font_size,
             origin,
             cursor,
-            matches,
-            selection,
+            covered,
+            under,
+            overdraws,
         }
     }
 
@@ -593,7 +710,7 @@ impl Element for TextFieldElement {
         // cleared with the frame that installed it.
         let dragged = self.field.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-            // The button being down is what makes this a drag. `is_selecting`
+            // The button being down is what makes this a drag. `selecting`
             // is only cleared on the release, so a press whose release went
             // somewhere we never heard about would otherwise leave a plain
             // hover dragging the run around.
@@ -605,15 +722,14 @@ impl Element for TextFieldElement {
             });
         });
         let lines = std::mem::take(&mut prepaint.lines);
-        let matches = std::mem::take(&mut prepaint.matches);
-        let selection = std::mem::take(&mut prepaint.selection);
+        let under = std::mem::take(&mut prepaint.under);
         let cursor = prepaint.cursor.take();
         let origin = prepaint.origin;
 
         // Scrolled text runs past the box in both directions, so everything the
         // field draws is masked to it — text, selection and caret alike.
         window.with_content_mask(Some(gpui::ContentMask::new(bounds)), |window| {
-            for quad in matches.into_iter().chain(selection) {
+            for quad in under {
                 window.paint_quad(quad);
             }
 
@@ -623,6 +739,14 @@ impl Element for TextFieldElement {
                     .ok();
                 top.y += line.size(line_height).height;
             }
+            overdraw::paint(
+                lines.iter().map(|line| &***line),
+                origin,
+                line_height,
+                px(0.),
+                &prepaint.overdraws,
+                window,
+            );
 
             // The caret only exists while focused — an unfocused field showing
             // one reads as two cursors on screen.
@@ -631,11 +755,49 @@ impl Element for TextFieldElement {
                 && let Some(cursor) = cursor
             {
                 window.paint_quad(cursor);
+                if let Some(covered) = &prepaint.covered {
+                    caret::paint_covered(
+                        &covered.layout,
+                        &covered.range,
+                        covered.at,
+                        line_height,
+                        covered.color,
+                        window,
+                    );
+                }
+            }
+
+            for (slot, glyph) in &prepaint.glyphs {
+                let Some(data) = glyph.data() else { continue };
+                let (Some(start), Some(end)) = (
+                    position_for_offset(&lines, slot.start, line_height),
+                    position_for_offset(&lines, slot.end, line_height),
+                ) else {
+                    continue;
+                };
+                let side = (end.x - start.x).min(prepaint.font_size);
+                let bounds = Bounds::new(
+                    origin + start + gpui::point(px(0.), (line_height - side) / 2.),
+                    gpui::size(side, side),
+                );
+                let path = SharedString::from(format!("field-glyph-{:p}", data.as_ptr()));
+                window
+                    .paint_svg(
+                        bounds,
+                        path,
+                        Some(data),
+                        gpui::TransformationMatrix::unit(),
+                        prepaint.glyph_color,
+                        cx,
+                    )
+                    .ok();
             }
         });
 
+        let shown = std::mem::take(&mut prepaint.shown);
         self.field.update(cx, |field, _| {
             field.last_layout = lines;
+            field.last_shown = shown;
             field.last_bounds = Some(bounds);
         });
     }

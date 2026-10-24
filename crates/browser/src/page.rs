@@ -1,7 +1,8 @@
-use crate::{DataStore, LoadState, host::Surface};
+use crate::{ConsoleMessage, DataStore, LoadState, host::Surface};
 use gpui::{AnyWindowHandle, App, Bounds, FocusHandle, Keystroke, Pixels, RenderImage, Window};
 use std::{
     cell::{Cell, RefCell},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -26,8 +27,11 @@ pub(crate) enum Report {
     Title(String),
     /// The page asked for a window of its own, for this URL.
     Opened(String),
+    Console(ConsoleMessage),
     /// A still of the page, taken for a cover; `None` if the capture failed.
     Still(Option<Arc<RenderImage>>),
+    /// The page was built, or failed to be, after the paint that asked for it.
+    Built,
 }
 
 /// Whether something is painted over the page.
@@ -61,8 +65,16 @@ pub(crate) struct Page {
     pub(crate) user_agent: RefCell<Option<String>>,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) store: RefCell<DataStore>,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) console: Cell<bool>,
+    #[cfg(feature = "inspector")]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) inspector: Cell<bool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     view: std::cell::OnceCell<Option<wry::WebView>>,
+    /// A build is on its way; see [`Page::request`].
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    building: Cell<bool>,
     /// Where the page last sat; `None` before the first paint and while parked.
     placed: Cell<Option<Bounds<Pixels>>>,
     /// The window the page is in; `None` before the first paint.
@@ -92,8 +104,13 @@ impl Page {
             url: RefCell::new(url),
             user_agent: RefCell::new(None),
             store: RefCell::new(DataStore::default()),
+            console: Cell::new(false),
+            #[cfg(feature = "inspector")]
+            inspector: Cell::new(false),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             view: std::cell::OnceCell::new(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            building: Cell::new(false),
             placed: Cell::new(None),
             window: Cell::new(None),
             owner: Cell::new(0),
@@ -115,8 +132,8 @@ impl Surface for Page {
         &self.owner
     }
 
-    fn place(&self, bounds: Bounds<Pixels>, window: &Window) {
-        Page::place(self, bounds, window);
+    fn place(this: &Rc<Self>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        Page::place(this, bounds, window, cx);
     }
 
     fn park(&self) {
@@ -191,32 +208,96 @@ impl Page {
         addEventListener('hashchange', moved);
     })();";
 
-    fn place(&self, bounds: Bounds<Pixels>, window: &Window) {
-        self.uncover();
-        let view = self.view.get_or_init(|| self.build(bounds, window));
+    /// Run in every frame. wry defines `window.ipc` in the main frame only on
+    /// macOS, so this posts to the handler behind it. Each message is
+    /// `{level, text}` as JSON.
+    // TODO: whether `chrome.webview` exists in a WebView2 iframe is unchecked.
+    const CONSOLE: &str = "(() => {
+        const handler = window.webkit?.messageHandlers?.ipc ?? window.chrome?.webview;
+        if (!handler) return;
+        const text = (value) => {
+            if (typeof value === 'string') return value;
+            if (value instanceof Error) return value.stack || String(value);
+            try {
+                return JSON.stringify(value) ?? String(value);
+            } catch {
+                return String(value);
+            }
+        };
+        const send = (level, values) => {
+            try {
+                handler.postMessage(JSON.stringify({ level, text: values.map(text).join(' ') }));
+            } catch {}
+        };
+        for (const level of ['debug', 'log', 'info', 'warn', 'error']) {
+            const original = console[level];
+            console[level] = function (...values) {
+                send(level, values);
+                return original.apply(this, values);
+            };
+        }
+        addEventListener('error', (event) => send('error', [event.error ?? event.message]));
+        addEventListener('unhandledrejection', (event) =>
+            send('error', ['Uncaught (in promise)', event.reason]));
+    })();";
+
+    fn place(this: &Rc<Self>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        this.uncover();
+        let Some(view) = this.view.get() else {
+            Self::request(this, bounds, window, cx);
+            return;
+        };
         let Some(view) = view else { return };
-        if self.window.get() != Some(window.window_handle()) {
-            self.give_keys();
-            self.platform.parked();
+        if this.window.get() != Some(window.window_handle()) {
+            this.give_keys();
+            this.platform.parked();
             if !platform::reparent(view, window) {
                 return;
             }
-            self.window.set(Some(window.window_handle()));
-            self.placed.set(None);
+            this.window.set(Some(window.window_handle()));
+            this.placed.set(None);
         }
-        let placed = self.placed.get();
+        let placed = this.placed.get();
         if placed == Some(bounds) {
             return;
         }
         let _ = view.set_bounds(rect(bounds));
         let _ = view.set_visible(true);
-        self.placed.set(Some(bounds));
-        if placed.is_none() && self.focus.is_focused(window) {
-            self.take_keys();
+        this.placed.set(Some(bounds));
+        if placed.is_none() && this.focus.is_focused(window) {
+            this.take_keys();
         }
     }
 
-    fn build(&self, bounds: Bounds<Pixels>, window: &Window) -> Option<wry::WebView> {
+    /// Builds the page in a task of its own, between gpui updates, and reports
+    /// [`Report::Built`] when it lands. The page is built hidden and shown by
+    /// the next [`Page::place`].
+    ///
+    /// On Windows wry starts WebView2 by pumping the thread's messages, and a
+    /// message that enters gpui while the `App` is borrowed aborts the process.
+    fn request(this: &Rc<Self>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        if this.building.replace(true) {
+            return;
+        }
+        let page = this.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok((handle, parent)) =
+                    cx.update(|window, _| (window.window_handle(), Parent::of(window)))
+                else {
+                    return;
+                };
+                let view = parent.and_then(|parent| page.build(bounds, &parent));
+                if view.is_some() {
+                    page.window.set(Some(handle));
+                }
+                let _ = page.view.set(view);
+                let _ = page.reports.try_send(Report::Built);
+            })
+            .detach();
+    }
+
+    fn build(&self, bounds: Bounds<Pixels>, parent: &Parent) -> Option<wry::WebView> {
         let url = self.url.borrow();
         let (ipc, loads, titles, opened) = (
             self.reports.clone(),
@@ -235,11 +316,15 @@ impl Page {
                 .with_incognito(store.incognito)
                 .with_url(url.as_str())
                 .with_bounds(rect(bounds))
+                .with_visible(false)
                 .with_initialization_script(Self::MOVED)
                 .with_ipc_handler(move |request| {
                     let report = match request.body().as_str() {
                         "moved" => Report::Moved,
-                        _ => return,
+                        body => match logged(body, request.uri().to_string()) {
+                            Some(message) => Report::Console(message),
+                            None => return,
+                        },
                     };
                     let _ = ipc.try_send(report);
                 })
@@ -266,13 +351,20 @@ impl Page {
                 Some(user_agent) => builder.with_user_agent(user_agent),
                 None => builder,
             };
+            let builder = if self.console.get() {
+                builder.with_initialization_script_for_main_only(Self::CONSOLE, false)
+            } else {
+                builder
+            };
+            #[cfg(feature = "inspector")]
+            let builder = builder.with_devtools(self.inspector.get());
             let builder = platform::store(builder, store.identifier);
-            platform::build(builder, window)?
+            builder
+                .build_as_child(parent)
                 .inspect_err(|error| tracing::warn!(%error, url = %url, "webview: build"))
                 .ok()
         })?;
         self.platform.attach(&view, &self.reports);
-        self.window.set(Some(window.window_handle()));
         Some(view)
     }
 
@@ -359,6 +451,13 @@ impl Page {
         self.built()?.url().ok()
     }
 
+    #[cfg(feature = "inspector")]
+    pub(crate) fn open_inspector(&self) {
+        if let Some(view) = self.built() {
+            platform::open_inspector(view);
+        }
+    }
+
     /// Whether the script was handed to the page.
     pub(crate) fn eval(&self, script: &str, done: impl Fn(String) + Send + 'static) -> bool {
         self.built()
@@ -403,6 +502,58 @@ impl Page {
             ..rect(bounds)
         });
     }
+}
+
+/// The native window a page is built in, by its raw handle: the build runs
+/// while gpui's `Window` is not borrowed.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+struct Parent(raw_window_handle::RawWindowHandle);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl Parent {
+    fn of(window: &Window) -> Option<Self> {
+        raw_window_handle::HasWindowHandle::window_handle(window)
+            .ok()
+            .map(|handle| Self(handle.as_raw()))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl raw_window_handle::HasWindowHandle for Parent {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: read from a gpui window on this thread in the update just
+        // before the build. On macOS nothing runs between the two. On Windows
+        // the messages WebView2's start pumps can close the window, and a
+        // destroyed HWND fails the build.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.0) })
+    }
+}
+
+/// A console message the [`Page::CONSOLE`] script posted from `source`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn logged(body: &str, source: String) -> Option<ConsoleMessage> {
+    #[derive(serde::Deserialize)]
+    struct Logged {
+        level: String,
+        text: String,
+    }
+    let Logged { level, text } = serde_json::from_str(body).ok()?;
+    use crate::ConsoleLevel;
+    let level = match level.as_str() {
+        "debug" => ConsoleLevel::Debug,
+        "log" => ConsoleLevel::Log,
+        "info" => ConsoleLevel::Info,
+        "warn" => ConsoleLevel::Warn,
+        "error" => ConsoleLevel::Error,
+        _ => return None,
+    };
+    Some(ConsoleMessage {
+        level,
+        text,
+        source,
+    })
 }
 
 /// Runs `build` with the context for `directory`, or with none, which has wry
@@ -466,5 +617,29 @@ fn rect(bounds: Bounds<Pixels>) -> wry::Rect {
             f64::from(f32::from(bounds.size.height)),
         )
         .into(),
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod tests {
+    use super::logged;
+    use crate::ConsoleLevel;
+
+    #[test]
+    fn reads_a_posted_message() {
+        let message = logged(
+            r#"{"level":"warn","text":"low disk"}"#,
+            "https://a.test/".into(),
+        );
+        let message = message.expect("a console message");
+        assert_eq!(message.level, ConsoleLevel::Warn);
+        assert_eq!(message.text, "low disk");
+        assert_eq!(message.source, "https://a.test/");
+    }
+
+    #[test]
+    fn ignores_what_is_not_one() {
+        assert!(logged("moved", String::new()).is_none());
+        assert!(logged(r#"{"level":"trace","text":""}"#, String::new()).is_none());
     }
 }

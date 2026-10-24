@@ -45,13 +45,6 @@ impl State {
 
 pub(super) fn start(_window: &Window, _cx: &mut App) {}
 
-pub(super) fn build(
-    builder: wry::WebViewBuilder<'_>,
-    window: &Window,
-) -> Option<wry::Result<wry::WebView>> {
-    Some(builder.build_as_child(window))
-}
-
 /// Uses the persistent store `identifier` names; wry falls back to the default
 /// store before macOS 14.
 pub(super) fn store<'a>(
@@ -148,6 +141,24 @@ pub(super) fn forward(view: &wry::WebView) {
 pub(super) fn reload_bypassing_cache(view: &wry::WebView) {
     // SAFETY: called on the main thread.
     unsafe { view.webview().reloadFromOrigin() };
+}
+
+/// Opens the inspector in its own window. Attached, WebKit adds the inspector
+/// to the page's superview, gpui's view, and resizes the page behind gpui's
+/// layout.
+#[cfg(feature = "inspector")]
+pub(super) fn open_inspector(view: &wry::WebView) {
+    use objc2::{rc::Retained, runtime::AnyObject};
+
+    view.open_devtools();
+    // SAFETY: `_inspector` is WKWebView's private `_WKInspector`, present on
+    // a page built with developer extras, which `open_devtools` assumes too.
+    unsafe {
+        let inspector: Option<Retained<AnyObject>> = objc2::msg_send![&*view.webview(), _inspector];
+        if let Some(inspector) = inspector {
+            let _: () = objc2::msg_send![&inspector, detach];
+        }
+    }
 }
 
 /// Takes a still of the page's visible rect, at the backing scale. `done`

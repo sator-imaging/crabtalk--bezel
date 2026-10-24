@@ -29,16 +29,10 @@ fn every_kind_declares_the_parts_a_caret_can_enter() {
             vec![Part::Body],
         ),
         (
-            BlockKind::Quote {
-                kind: None,
-                text: Text::plain("a"),
-            },
-            vec![Part::Body],
-        ),
-        (
             BlockKind::Code {
                 language: None,
                 code: Text::default(),
+                height: None,
             },
             vec![Part::Code],
         ),

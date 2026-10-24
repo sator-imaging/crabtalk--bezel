@@ -17,9 +17,10 @@ mod scaffolding;
 mod status;
 
 pub use button::Button;
-pub use buttons::{ButtonRole, ButtonStyle, Buttons, ICON_EDGE_PAD, ICON_GLYPH};
+pub use buttons::{ButtonRole, ButtonStyle, Buttons, ICON_EDGE_PAD, ICON_GLYPH, SplitButton};
 pub use content::Content;
 pub use controls::{Controls, SliderDrag, slider_fraction};
+pub(crate) use controls::{on_track_height, track};
 pub use icon::Icons;
 pub use layout::{Layout, SPLIT_HANDLE_HIT, SplitDrag, SplitStyle};
 pub use scaffolding::{OPTION_CARD_HEIGHT, OPTION_CARD_RADIUS, Scaffolding};

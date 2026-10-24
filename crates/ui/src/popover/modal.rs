@@ -15,7 +15,8 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 }
 
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
-/// The scrim swallows clicks; the caller wires its own dismiss/confirm.
+/// The scrim swallows clicks; the caller wires its own dismiss/confirm. Binds
+/// no keys, `escape` included.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
 /// so the scrim needs explicit dimensions). The frost radius matches
 /// [`dialog_card`]'s 16px rounding.
@@ -92,7 +93,7 @@ pub(super) fn modal_with(
                     )),
             ),
     )
-    .priority(2)
+    .priority(MODAL_LAYER)
     .into_any_element()
 }
 
@@ -144,15 +145,15 @@ pub fn sheet_panel(theme: &Theme, side: Side) -> gpui::Div {
         Side::Left => card
             .rounded_r(px(DIALOG_RADIUS))
             .border_r_1()
-            .border_color(hairline(0.10)),
+            .border_color(theme.border),
         Side::Right => card
             .rounded_l(px(DIALOG_RADIUS))
             .border_l_1()
-            .border_color(hairline(0.10)),
+            .border_color(theme.border),
         Side::Bottom => card
             .rounded_t(px(DIALOG_RADIUS))
             .border_t_1()
-            .border_color(hairline(0.10)),
+            .border_color(theme.border),
     };
     if theme.glass {
         card.bg(theme.glass_overlay())
@@ -239,6 +240,6 @@ pub fn sheet(
                     .child(panel),
             ),
     )
-    .priority(2)
+    .priority(MODAL_LAYER)
     .into_any_element()
 }

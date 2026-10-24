@@ -12,7 +12,7 @@
 //! they would actually mean something.
 
 use crate::{
-    doc::{Align, Block, BlockKind, Doc, Mark, Part, Text},
+    doc::{Align, Block, BlockKind, Doc, Mark, Part, Run, Text},
     marks::Marks,
     select::Cursor,
 };
@@ -34,38 +34,222 @@ impl From<&Doc> for String {
 
 /// [`serialize`] with the app's own marks — see [`crate::Marks`].
 pub fn serialize_with(doc: &Doc, marks: &Marks) -> String {
+    let layout = Layout::of(&doc.blocks);
+    write_range(&doc.blocks, &layout, 0..doc.blocks.len(), marks)
+}
+
+/// Where each block stands when written.
+///
+/// A blank paragraph is not written: markdown has no spelling for one, and
+/// blank lines there separate blocks rather than being one. The empty body of
+/// an alert is the exception. Every other block's indent is clamped to one
+/// level under the written block before it, and its place in a blockquote is
+/// read off the written blocks alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// One per block: `None` for a block that is not written.
+    pub(crate) at: Vec<Option<Place>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub(crate) indent: u8,
+    pub(crate) run: Option<Run>,
+}
+
+impl Layout {
+    pub(crate) fn of(blocks: &[Block]) -> Self {
+        let mut at = Vec::with_capacity(blocks.len());
+        let mut previous: Option<u8> = None;
+        let mut runs = crate::doc::Runs::default();
+        for block in blocks {
+            if block.blank() {
+                at.push(None);
+                continue;
+            }
+            let indent = previous.map_or(0, |previous| block.indent.min(previous + 1));
+            previous = Some(indent);
+            at.push(Some(Place {
+                indent,
+                run: runs.next(block.quote, indent),
+            }));
+        }
+        Self { at }
+    }
+
+    /// The layout of `blocks`, which are the blocks this was laid out for
+    /// with `removed` replaced by `added` blocks. Laid out again from the
+    /// top-level block before the change to the first top-level block after it
+    /// that stands as it did.
+    pub(crate) fn respliced(
+        &self,
+        blocks: &[Block],
+        removed: std::ops::Range<usize>,
+        added: usize,
+    ) -> Self {
+        let start = (0..removed.start.min(self.at.len()))
+            .rev()
+            .find(|&ix| self.top(ix))
+            .unwrap_or(0);
+        let delta = added as isize - removed.len() as isize;
+        let changed_end = removed.start + added;
+        let mut at = self.at[..start].to_vec();
+        let mut previous: Option<u8> = None;
+        let mut runs = crate::doc::Runs::default();
+        for (ix, block) in blocks.iter().enumerate().skip(start) {
+            let place = (!block.blank()).then(|| {
+                let indent = previous.map_or(0, |previous| block.indent.min(previous + 1));
+                previous = Some(indent);
+                Place {
+                    indent,
+                    run: runs.next(block.quote, indent),
+                }
+            });
+            let was = (ix as isize - delta) as usize;
+            let top = place
+                .is_some_and(|place| place.indent == 0 && place.run.is_none_or(|run| run.first));
+            if ix >= changed_end && top && self.at.get(was) == Some(&place) {
+                at.extend_from_slice(&self.at[was..]);
+                return Self { at };
+            }
+            at.push(place);
+        }
+        Self { at }
+    }
+
+    /// Whether block `ix` is written at the top level: unindented, and opening
+    /// its blockquote if it is in one. Markdown read from such a block's start
+    /// reads the same as it does in place.
+    pub(crate) fn top(&self, ix: usize) -> bool {
+        self.at[ix].is_some_and(|place| place.indent == 0 && place.run.is_none_or(|run| run.first))
+    }
+}
+
+/// Blocks `range` of `blocks` as markdown, each followed by the gap to the
+/// next written block. The gap after the range's last written block is the
+/// one to the first written block past it, or the document's tail where
+/// none is.
+///
+/// A block that is not written writes nothing and takes no gap.
+pub(crate) fn write_range(
+    blocks: &[Block],
+    layout: &Layout,
+    range: std::ops::Range<usize>,
+    marks: &Marks,
+) -> String {
     let mut out = String::new();
-    let mut previous: Option<(&BlockKind, u8)> = None;
+    for ix in range {
+        write_one(&mut out, blocks, layout, ix, marks);
+    }
+    out
+}
 
-    for block in &doc.blocks {
-        let indent = match previous {
-            Some((_, prev)) => block.indent.min(prev + 1),
-            None => 0,
-        };
+/// Block `ix` and the gap after it, as [`write_range`] writes them.
+pub(crate) fn write_one(
+    out: &mut String,
+    blocks: &[Block],
+    layout: &Layout,
+    ix: usize,
+    marks: &Marks,
+) {
+    write_one_as(out, &blocks[ix], blocks, layout, ix, marks);
+}
 
-        if let Some((prev_kind, prev_indent)) = previous {
-            out.push('\n');
-            if !tight_after(prev_kind, &block.kind, indent > prev_indent) {
-                out.push('\n');
+/// [`write_one`] with `block`'s texts in place of block `ix`'s. Everything
+/// else, the gap included, is decided by `blocks`.
+pub(crate) fn write_one_as(
+    out: &mut String,
+    block: &Block,
+    blocks: &[Block],
+    layout: &Layout,
+    ix: usize,
+    marks: &Marks,
+) {
+    let Some(place) = layout.at[ix] else { return };
+    write_text(out, block, place, marks);
+    write_gap_after(out, blocks, layout, ix);
+}
+
+/// The gap [`write_one`] writes after block `ix`, alone.
+pub(crate) fn write_gap_after(out: &mut String, blocks: &[Block], layout: &Layout, ix: usize) {
+    let Some(place) = layout.at[ix] else { return };
+    let next = (ix + 1..blocks.len()).find_map(|next| layout.at[next].map(|at| (next, at)));
+    match next {
+        Some((next, at)) => write_gap(out, &blocks[ix].kind, place, &blocks[next].kind, at),
+        None => {
+            // GFM reads `[ ]` as a task marker only when whitespace follows
+            // it, and an empty task has no text to supply it. Every block but
+            // the last is followed by the newline of the block after; the last
+            // is followed by nothing.
+            if matches!(&blocks[ix].kind, BlockKind::Task { text, .. } if text.is_empty()) {
+                out.push(' ');
             }
         }
-
-        write_block(&mut out, &block.kind, indent, marks);
-        previous = Some((&block.kind, indent));
     }
+}
 
-    // GFM reads `[ ]` as a task marker only when whitespace follows it, and an
-    // empty task has no text to supply it. Every block but the last is followed
-    // by the newline of the block after; the last is followed by nothing.
-    if doc
-        .blocks
-        .last()
-        .is_some_and(|block| matches!(&block.kind, BlockKind::Task { text, .. } if text.is_empty()))
+/// A blockquote's `>` stands at its level, and the block is written after it
+/// as if the level were the margin: the prefix, and the indent within it.
+fn quote_prefix(place: Place) -> (String, u8) {
+    match place.run {
+        Some(run) => (
+            format!("{}> ", INDENT.repeat(run.level as usize)),
+            place.indent - run.level,
+        ),
+        None => (String::new(), place.indent),
+    }
+}
+
+fn write_text(out: &mut String, block: &Block, place: Place, marks: &Marks) {
+    let (prefix, inner) = quote_prefix(place);
+    let mut written = String::new();
+    write_block(&mut written, &block.kind, inner, marks);
+    if let Some(alert) = block.quote.and_then(|quote| quote.alert)
+        && place.run.is_some_and(|run| run.first)
     {
-        out.push(' ');
+        // A marker line stands alone when nothing at all is under it.
+        let body = std::mem::take(&mut written);
+        written.push_str(alert.marker());
+        if !body.is_empty() {
+            written.push('\n');
+            written.push_str(&body);
+        }
     }
+    for (ix, line) in written.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        if line.is_empty() {
+            out.push_str(prefix.trim_end());
+        } else {
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+}
 
-    out
+/// The newlines between a block written at `before` and the next, at `after`.
+fn write_gap(
+    out: &mut String,
+    previous: &BlockKind,
+    before: Place,
+    next: &BlockKind,
+    after: Place,
+) {
+    out.push('\n');
+    // A quote's edge takes a blank line, which is what ends one blockquote
+    // before the next block or the next blockquote. Only an empty marker
+    // cannot have one after it.
+    let edge =
+        after.run.is_some_and(|run| run.first) || (after.run.is_none() && before.run.is_some());
+    if !tight_after(previous, next, after.indent > before.indent)
+        || (edge && !is_empty_marker(previous))
+    {
+        if after.run.is_some_and(|run| !run.first) {
+            out.push_str(quote_prefix(after).0.trim_end());
+        }
+        out.push('\n');
+    }
 }
 
 /// Which list a marker block belongs to. Two markers of different kinds are two
@@ -155,27 +339,19 @@ fn write_block(out: &mut String, kind: &BlockKind, indent: u8, marks: &Marks) {
             let marker = if *checked { "- [x] " } else { "- [ ] " };
             write_marked(out, &pad, marker, text, marks);
         }
-        BlockKind::Quote { kind, text } => {
-            let prefix = format!("{pad}> ");
-            // Rendered before the marker is written: an empty [`Text`] can
-            // still carry a mark, and a marker line stands alone only when
-            // there is nothing at all under it.
-            let body = inline(text, marks);
-            if let Some(kind) = kind {
-                out.push_str(&prefix);
-                out.push_str(kind.marker());
-                if body.is_empty() {
-                    return;
-                }
-                out.push('\n');
-            }
-            write_lines(out, &prefix, &prefix, &body);
-        }
-        BlockKind::Code { language, code } => {
+        BlockKind::Code {
+            language,
+            code,
+            height,
+        } => {
             let fence = "`".repeat(fence_width(&code.text));
             out.push_str(&pad);
             out.push_str(&fence);
             out.push_str(language.as_deref().unwrap_or(""));
+            if let Some(height) = height {
+                out.push(' ');
+                out.push_str(&height.to_string());
+            }
             for line in code.text.split('\n') {
                 out.push('\n');
                 out.push_str(&pad);
@@ -492,7 +668,7 @@ fn close_mark(out: &mut String, mark: &Mark, italic: char, marks: &Marks) {
             out.push_str("](");
             write_destination(out, url);
             out.push_str(" \"");
-            out.push_str(form.title().unwrap_or("chip"));
+            out.push_str(&form.title().unwrap_or_else(|| "chip".to_owned()));
             out.push_str("\")");
         }
         Mark::Custom(name) => out.push_str(marks.delimiter(name).unwrap_or("")),
@@ -574,6 +750,16 @@ fn escape_inline(out: &mut String, s: &str, marks: &Marks, lead: Lead) {
 /// line. Only ever fires at a line start — mid-line these characters are
 /// ordinary text, and escaping them there is what turns `#123` into `\#123`.
 fn escape_block_marker<'a>(out: &mut String, line: &'a str, lead: Lead) -> &'a str {
+    // A position's sentinel is gone once the text is written, so what follows
+    // it is what starts the line.
+    let placed = line.len()
+        - line
+            .trim_start_matches(|c| sentinel_index(c).is_some())
+            .len();
+    if placed > 0 {
+        out.push_str(&line[..placed]);
+        return escape_block_marker(out, &line[placed..], lead);
+    }
     let after_space = |rest: &str| rest.starts_with([' ', '\t']) || rest.is_empty();
 
     let hashes = line.len() - line.trim_start_matches('#').len();
@@ -612,7 +798,11 @@ fn escape_block_marker<'a>(out: &mut String, line: &'a str, lead: Lead) -> &'a s
 
     // A run of `-` or `=` alone is a thematic break or a setext underline.
     let trimmed = line.trim_end();
-    if !trimmed.is_empty() && trimmed.chars().all(|c| c == '=' || c == '-') {
+    let mut bare = trimmed
+        .chars()
+        .filter(|c| sentinel_index(*c).is_none())
+        .peekable();
+    if bare.peek().is_some() && bare.all(|c| c == '=' || c == '-') {
         out.push('\\');
         out.push_str(&line[..1]);
         return &line[1..];
@@ -686,9 +876,36 @@ fn escape_span(out: &mut String, s: &str, marks: &Marks) {
     }
 }
 
-/// A mark nothing escapes, nothing renders and no document carries: the
-/// private-use codepoint both directions of the caret mapping ride on.
-pub(crate) const SENTINEL: char = '\u{E000}';
+/// The private-use codepoints the position mapping rides on, one per
+/// position: plane 15, clear of the ones [`crate::parse`] lifts marks to.
+const SENTINELS: std::ops::RangeInclusive<u32> = 0xF0000..=0xFFFFD;
+
+/// The sentinel standing for position `ix`, or `None` past the last one.
+pub(crate) fn sentinel(ix: usize) -> Option<char> {
+    let code = SENTINELS.start().checked_add(u32::try_from(ix).ok()?)?;
+    SENTINELS
+        .contains(&code)
+        .then(|| char::from_u32(code))
+        .flatten()
+}
+
+/// Which position a sentinel stands for.
+pub(crate) fn sentinel_index(c: char) -> Option<usize> {
+    SENTINELS
+        .contains(&(c as u32))
+        .then(|| (c as u32 - SENTINELS.start()) as usize)
+}
+
+/// Whether any text in `doc` already holds a sentinel.
+fn carries_sentinel(doc: &Doc) -> bool {
+    doc.blocks.iter().any(|block| {
+        block.parts().into_iter().any(|part| {
+            block
+                .text_at(part)
+                .is_some_and(|text| text.text.chars().any(|c| sentinel_index(c).is_some()))
+        })
+    })
+}
 
 /// The document as markdown, and where `at` landed in it.
 ///
@@ -697,31 +914,58 @@ pub(crate) const SENTINEL: char = '\u{E000}';
 /// sentinel came out is the answer. The string comes back without it.
 ///
 /// The offset is the end of the output for a caret this cannot place — a
-/// document already carrying the sentinel, or a part that no longer exists.
+/// document already carrying a sentinel, or a part that no longer exists.
 pub fn serialize_at(doc: &Doc, at: Cursor, marks: &Marks) -> (String, usize) {
+    let (source, offsets) = serialize_at_many(doc, &[at], marks);
+    let end = source.len();
+    (source, offsets[0].unwrap_or(end))
+}
+
+/// [`serialize_at`] for many positions in one pass: where each of `at`
+/// landed, in the same order, `None` for one this cannot place.
+pub fn serialize_at_many(doc: &Doc, at: &[Cursor], marks: &Marks) -> (String, Vec<Option<usize>>) {
     let mut doc = doc.clone();
-    let placed = doc
-        .blocks
-        .get_mut(at.block)
-        .and_then(|block| block.text_at_mut(at.part))
-        .filter(|text| !text.text.contains(SENTINEL))
-        .map(|text| {
-            text.insert(
-                at.offset.min(text.text.len()),
-                SENTINEL.encode_utf8(&mut [0; 4]),
-            )
-        })
-        .is_some();
-    // Normalized *after* the sentinel goes in, so the string this returns is
-    // the one the offset indexes into — a trailing space is only trailing
+    let mut placed = vec![false; at.len()];
+    if !carries_sentinel(&doc) {
+        // Back to front, so each insert leaves the offsets still to come where
+        // they were.
+        let mut order: Vec<usize> = (0..at.len()).collect();
+        order.sort_by_key(|&ix| std::cmp::Reverse(at[ix]));
+        for ix in order {
+            let Some(mark) = sentinel(ix) else { continue };
+            let Some(text) = doc
+                .blocks
+                .get_mut(at[ix].block)
+                .and_then(|block| block.text_at_mut(at[ix].part))
+            else {
+                continue;
+            };
+            let offset = at[ix].offset.min(text.text.len());
+            if text.text.is_char_boundary(offset) {
+                text.insert(offset, mark.encode_utf8(&mut [0; 4]));
+                placed[ix] = true;
+            }
+        }
+    }
+    // Normalized *after* the sentinels go in, so the string this returns is
+    // the one the offsets index into — a trailing space is only trailing
     // while nothing sits after it.
     doc.normalize_with(marks);
-    let mut source = serialize_with(&doc, marks);
-    let Some(offset) = placed.then(|| source.find(SENTINEL)).flatten() else {
-        source = source.replace(SENTINEL, "");
-        let end = source.len();
-        return (source, end);
-    };
-    source.remove(offset);
-    (source, offset)
+    let written = serialize_with(&doc, marks);
+    if !placed.contains(&true) {
+        return (written, vec![None; at.len()]);
+    }
+    let mut source = String::with_capacity(written.len());
+    let mut offsets = vec![None; at.len()];
+    for c in written.chars() {
+        match sentinel_index(c) {
+            Some(ix) => {
+                if placed.get(ix) == Some(&true) {
+                    offsets[ix] = Some(source.len());
+                }
+            }
+            None => source.push(c),
+        }
+    }
+    (source, offsets)
 }

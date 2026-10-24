@@ -17,7 +17,8 @@
 //! // Each frame: flatten what is open, paint it, and let `step` answer the keys.
 //! let rows = self.flatten();                       // Vec<(Row, label)>
 //! tree().children(rows.iter().enumerate().map(|(index, (row, label))| {
-//!     tree_row(&theme, row, self.selected == Some(index), self.cursor == index)
+//!     let selected = Selection::new(self.selected == Some(index), self.focused);
+//!     tree_row(&theme, row, selected, self.cursor == index)
 //!         .id(("row", index))
 //!         .child(label.clone())
 //! }))
@@ -29,7 +30,7 @@
 
 use gpui::{App, KeyBinding, actions, div, prelude::*, px};
 
-use theme::{TextStyle, Theme, Typeset, hairline};
+use theme::{Selection, TextStyle, Theme, Typeset};
 
 use crate::widgets::Layout;
 
@@ -115,7 +116,9 @@ pub fn step(rows: &[Row], cursor: usize, direction: Direction) -> Option<Move> {
 
 actions!(bezel_tree, [SelectPrevious, SelectNext, Collapse, Expand]);
 
-/// The key context a tree claims.
+/// The key context a tree claims. [`tree`] does not set it: the caller puts it,
+/// with focus tracking and a handler per action, on the element holding the
+/// rows.
 pub const KEY_CONTEXT: &str = "Tree";
 
 /// Install the bindings — [`bindings`], bound. Call once, alongside
@@ -145,6 +148,9 @@ pub fn bindings() -> Vec<KeyBinding> {
     bindings
 }
 
+/// How far a row sits in from either side of the tree.
+const ROW_INSET: f32 = 4.0;
+
 /// How far one level of nesting indents.
 pub const INDENT: f32 = 14.0;
 /// Width of the chevron column, kept by leaves as well so their labels line up
@@ -161,18 +167,22 @@ pub fn tree() -> gpui::Div {
 ///
 /// `selected` is what the app considers chosen; `cursor` is where the keyboard
 /// is. Two tones, because a tree shows both at once.
-pub fn tree_row(theme: &Theme, row: &Row, selected: bool, cursor: bool) -> gpui::Div {
+pub fn tree_row(theme: &Theme, row: &Row, selected: Selection, cursor: bool) -> gpui::Div {
     let mut frame = div()
         .flex()
         .flex_row()
         .items_center()
-        .w_full()
+        .mx(px(ROW_INSET))
+        .rounded(px(Theme::control_radius()))
         .py(px(3.0))
         .pr(px(8.0))
         .text_style(TextStyle::Callout)
         .cursor_pointer();
-    frame = if selected {
-        frame.bg(theme.card_selected_bg()).text_color(theme.text)
+    frame = if let Some(fill) = selected.fill(theme) {
+        frame
+            .bg(fill)
+            .shadow(selected.shadows())
+            .text_color(theme.text)
     } else if cursor {
         frame.bg(theme::wash(0.05)).text_color(theme.text)
     } else {
@@ -188,7 +198,7 @@ pub fn tree_row(theme: &Theme, row: &Row, selected: bool, cursor: bool) -> gpui:
                 .w(px(INDENT))
                 .h(px(18.0))
                 .border_l_1()
-                .border_color(hairline(0.08))
+                .border_color(theme.border)
         }))
         .child(
             div()

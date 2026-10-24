@@ -1,6 +1,7 @@
 use markdown::*;
-
 use markdown::{parse::parse, serialize::serialize};
+
+mod common;
 
 fn text_of(doc: &Doc, ix: usize) -> &Text {
     doc.blocks[ix]
@@ -92,20 +93,47 @@ fn enter_after_a_heading_gives_body_text() {
 }
 
 #[test]
+fn enter_at_the_start_of_a_heading_moves_it_down_whole() {
+    let mut doc = parse("## abc");
+    assert_eq!(doc.split(0, 0), 1, "the caret stays with the heading");
+    assert!(matches!(doc.blocks[0].kind, BlockKind::Paragraph(_)));
+    assert!(text_of(&doc, 0).text.is_empty());
+    assert!(matches!(
+        doc.blocks[1].kind,
+        BlockKind::Heading { level: 2, .. }
+    ));
+    assert_eq!(text_of(&doc, 1).text, "abc");
+}
+
+#[test]
+fn enter_in_a_heading_gives_its_tail_to_body_text() {
+    let mut doc = parse("## abc");
+    doc.split(0, 1);
+    assert!(matches!(
+        doc.blocks[0].kind,
+        BlockKind::Heading { level: 2, .. }
+    ));
+    assert_eq!(text_of(&doc, 0).text, "a");
+    assert!(matches!(doc.blocks[1].kind, BlockKind::Paragraph(_)));
+    assert_eq!(text_of(&doc, 1).text, "bc");
+}
+
+#[test]
 fn backspace_walks_out_before_it_merges() {
-    // Indented bullet: outdent, then unmarker, then merge.
+    // Indented bullet: unmarker, then outdent, then merge.
     let mut doc = parse("- a\n    - b");
     assert_eq!(doc.blocks[1].indent, 1);
 
     let start = Cursor::new(1, Part::Body, 0);
     doc.merge_back(start);
-    assert_eq!(doc.blocks[1].indent, 0, "first press outdents");
-
-    doc.merge_back(start);
     assert!(
         matches!(doc.blocks[1].kind, BlockKind::Paragraph(_)),
-        "second press drops the marker"
+        "first press drops the marker"
     );
+    assert_eq!(doc.blocks[1].indent, 1);
+
+    doc.merge_back(start);
+    assert_eq!(doc.blocks[1].indent, 0, "second press outdents");
 
     let caret = doc.merge_back(start);
     assert_eq!(
@@ -182,18 +210,6 @@ fn shortcuts_cover_the_slash_menu_vocabulary() {
     assert_ne!(shortcut("- [ ] x").map(|hit| hit.0), Some(Shortcut::Bullet));
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> usize {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as usize
-    }
-}
-
 /// The property that matters: no sequence of edits can reach a document
 /// the serializer cannot express. If this fails, the editor corrupts the
 /// file on save.
@@ -208,10 +224,8 @@ fn no_edit_sequence_escapes_the_round_trip() {
         "> [!TIP]\n> alert body\n\n> [!NOTE]",
         "para with [link](u) and ![img](i)",
     ];
-    const WORDS: &[&str] = &["x", " ", "\n", "a b", "**", "#", "- ", "`", "|", "~~"];
-    const MARKS: &[Mark] = &[Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code];
 
-    let mut rng = Rng(0xed17);
+    let mut rng = common::Rng(0xed17);
     for seed in SEEDS {
         for case in 0..20_000 {
             let mut doc = parse(seed);
@@ -220,60 +234,7 @@ fn no_edit_sequence_escapes_the_round_trip() {
                 if doc.blocks.is_empty() {
                     break;
                 }
-                let ix = rng.next() % doc.blocks.len();
-                let len = doc.blocks[ix]
-                    .text_at(Part::Body)
-                    .map_or(0, |text| text.text.len());
-                let a = if len == 0 { 0 } else { rng.next() % (len + 1) };
-                let b = if len == 0 { 0 } else { rng.next() % (len + 1) };
-
-                let at = Cursor::new(ix, Part::Body, 0);
-                match rng.next() % 8 {
-                    0 => {
-                        let word = WORDS[rng.next() % WORDS.len()];
-                        doc.edit_at(at, |text| text.insert(a, word));
-                    }
-                    1 => {
-                        doc.edit_at(at, |text| text.remove(a.min(b)..a.max(b)));
-                    }
-                    2 => {
-                        let mark = MARKS[rng.next() % MARKS.len()].clone();
-                        doc.edit_at(at, |text| text.toggle(a.min(b)..a.max(b), mark));
-                    }
-                    3 => {
-                        doc.split(ix, a);
-                    }
-                    4 => {
-                        doc.merge_back(at);
-                    }
-                    // A selection over any two positions in the document —
-                    // where every cross-block delete, cut and paste lands.
-                    5 => {
-                        let jx = rng.next() % doc.blocks.len();
-                        let jlen = doc.blocks[jx]
-                            .text_at(Part::Body)
-                            .map_or(0, |text| text.text.len());
-                        let c = if jlen == 0 {
-                            0
-                        } else {
-                            rng.next() % (jlen + 1)
-                        };
-                        let word = WORDS[rng.next() % WORDS.len()];
-                        doc.replace(
-                            Selection::new(
-                                Cursor::new(ix, Part::Body, a),
-                                Cursor::new(jx, Part::Body, c),
-                            ),
-                            Text::plain(word),
-                        );
-                    }
-                    6 => {
-                        doc.indent(ix);
-                    }
-                    _ => {
-                        doc.outdent(ix);
-                    }
-                }
+                common::edit_randomly(&mut doc, &mut rng);
 
                 // Offsets must stay inside the text they index — every part of
                 // every block, not just the ones an edit was aimed at.
@@ -342,35 +303,80 @@ fn marks_at_a_caret_are_the_ones_the_next_character_would_join() {
 }
 
 #[test]
-fn enter_at_the_start_of_an_alert_leaves_plain_text_above_it() {
+fn enter_in_a_quote_stays_in_the_quote() {
+    let note = Some(Quoted {
+        alert: Some(QuoteKind::Note),
+    });
+    let mut doc = parse("> [!NOTE]\n> - one");
+    let new = doc.split(0, 3);
+    assert_eq!(doc.blocks[new].quote, note);
+    assert!(matches!(doc.blocks[new].kind, BlockKind::Bullet(_)));
+
+    // At the start, the empty block that opens above is in the quote too.
     let mut doc = parse("> [!NOTE]\n> body");
     doc.split(0, 0);
-    assert!(
-        matches!(doc.blocks[0].kind, BlockKind::Paragraph(_)),
-        "the marker would otherwise be written twice, once over nothing"
-    );
-    assert!(matches!(
-        doc.blocks[1].kind,
-        BlockKind::Quote {
-            kind: Some(QuoteKind::Note),
-            ..
-        }
-    ));
+    assert_eq!(doc.blocks[0].quote, note);
     assert_eq!(text_of(&doc, 1).text, "body");
+    doc.normalize();
+    assert_eq!(serialize(&doc), "> [!NOTE]\n> body");
 }
 
 #[test]
-fn enter_in_an_alert_with_no_body_keeps_the_alert() {
-    let mut doc = parse("> [!TIP]");
-    doc.split(0, 0);
-    assert!(
-        matches!(
-            doc.blocks[0].kind,
-            BlockKind::Quote {
-                kind: Some(QuoteKind::Tip),
-                ..
-            }
-        ),
-        "nothing moved down, so nothing was left behind"
-    );
+fn peel_takes_the_marker_then_the_quote_then_the_indent() {
+    let mut doc = parse("- x\n\n    > - a");
+    assert!(doc.peel(1));
+    assert!(matches!(doc.blocks[1].kind, BlockKind::Paragraph(_)));
+    assert!(doc.blocks[1].quote.is_some());
+    assert_eq!(doc.blocks[1].indent, 1);
+    assert!(doc.peel(1));
+    assert_eq!(doc.blocks[1].quote, None);
+    assert_eq!(doc.blocks[1].indent, 1);
+    assert!(doc.peel(1));
+    assert_eq!(doc.blocks[1].indent, 0);
+    assert!(!doc.peel(1));
+}
+
+#[test]
+fn backspace_at_the_start_of_a_quoted_bullet_peels_before_it_merges() {
+    let mut doc = parse("a\n\n> - b");
+    let at = Cursor::new(1, Part::Body, 0);
+    assert_eq!(doc.merge_back(at), Some(at));
+    assert_eq!(serialize(&doc), "a\n\n> b");
+    assert_eq!(doc.merge_back(at), Some(at));
+    assert_eq!(serialize(&doc), "a\n\nb");
+    assert_eq!(doc.merge_back(at), Some(Cursor::new(0, Part::Body, 1)));
+    assert_eq!(serialize(&doc), "ab");
+}
+
+#[test]
+fn toggling_a_quote() {
+    let mut doc = parse("> a\n>\n> b\n\nc");
+
+    // Picking another alert recolours the whole quote.
+    doc.toggle_quote(1, Some(QuoteKind::Tip));
+    assert_eq!(serialize(&doc), "> [!TIP]\n> a\n>\n> b\n\nc");
+
+    // Picking the one it has takes the block out.
+    doc.toggle_quote(1, Some(QuoteKind::Tip));
+    assert_eq!(serialize(&doc), "> [!TIP]\n> a\n\nb\n\nc");
+
+    // And a block outside a quote goes in.
+    doc.toggle_quote(2, Some(QuoteKind::Tip));
+    assert_eq!(serialize(&doc), "> [!TIP]\n> a\n\nb\n\n> [!TIP]\n> c");
+}
+
+#[test]
+fn a_block_under_a_quoted_item_cannot_nest_outside_the_quote() {
+    let mut doc = parse("> - a\n>\n>     b");
+    assert_eq!(doc.blocks[1].indent, 1);
+    doc.set_quote(1, None);
+    assert_eq!(doc.blocks[1].indent, 0, "nothing could write it under `a`");
+    assert_eq!(parse(&serialize(&doc)), doc);
+}
+
+#[test]
+fn the_quote_shortcut_quotes_without_turning() {
+    let mut doc = parse("- item");
+    doc.apply(0, Shortcut::Quote);
+    assert_eq!(serialize(&doc), "> - item");
 }

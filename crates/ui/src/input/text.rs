@@ -146,3 +146,116 @@ pub fn next_word_boundary(text: &str, offset: usize) -> usize {
         .map(|(start, segment)| start + segment.len())
         .unwrap_or(text.len())
 }
+
+/// What a press selects by — a click places a caret, a double-click takes a
+/// word, a triple-click a line — and what a drag from that press extends by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    Char,
+    Word,
+    Line,
+}
+
+impl Granularity {
+    pub fn of_clicks(click_count: usize) -> Self {
+        match click_count {
+            0 | 1 => Self::Char,
+            2 => Self::Word,
+            _ => Self::Line,
+        }
+    }
+
+    /// The span of this unit holding `offset`. A word is the word-bound
+    /// segment touching `offset`, preferring one with alphanumeric content; a
+    /// line is the logical line.
+    pub fn around(self, text: &str, offset: usize) -> Range<usize> {
+        match self {
+            Self::Char => offset..offset,
+            Self::Word => {
+                let segments = || {
+                    text.split_word_bound_indices()
+                        .map(|(start, segment)| (start..start + segment.len(), is_word(segment)))
+                };
+                let after = segments().find(|(range, _)| range.contains(&offset));
+                let before = segments().find(|(range, _)| range.end == offset);
+                match (after, before) {
+                    (Some((range, true)), _) | (_, Some((range, true))) => range,
+                    (Some((range, _)), _) | (_, Some((range, _))) => range,
+                    (None, None) => offset..offset,
+                }
+            }
+            Self::Line => line_start(text, offset)..line_end(text, offset),
+        }
+    }
+}
+
+/// The `(anchor, head)` a drag holds once the pointer is over `span`, the unit
+/// under it, from a press that selected `pressed`. All of `pressed` stays
+/// selected whichever way the drag goes.
+pub fn drag_selection<T: Ord + std::marker::Copy>(pressed: Range<T>, span: Range<T>) -> (T, T) {
+    if span.start < pressed.start {
+        (pressed.end, span.start)
+    } else {
+        (pressed.start, span.end.max(pressed.end))
+    }
+}
+
+/// Where atoms — ranges of a source text painted as something else — line up
+/// between that text and the text painted for it, in document order, as
+/// `(source, shown)` pairs.
+///
+/// An offset inside an atom's source has no place in what it shows, and one
+/// inside what it shows has none in the source: each lands on an end.
+#[derive(Clone, Debug, Default)]
+pub struct Shown(std::rc::Rc<[(Range<usize>, Range<usize>)]>);
+
+impl Shown {
+    /// `pairs` must be in document order and must not overlap.
+    pub fn new(pairs: Vec<(Range<usize>, Range<usize>)>) -> Self {
+        Self(pairs.into())
+    }
+
+    /// Where a source offset shows. One inside an atom lands on its start.
+    pub fn at(&self, offset: usize) -> usize {
+        self.map(offset, false)
+    }
+
+    /// Where a source range shows. An end inside an atom takes all of it.
+    pub fn range(&self, range: &Range<usize>) -> Range<usize> {
+        self.map(range.start, false)..self.map(range.end, true)
+    }
+
+    fn map(&self, offset: usize, end: bool) -> usize {
+        let mut shift = 0isize;
+        for (source, shown) in self.0.iter() {
+            if offset <= source.start {
+                break;
+            }
+            if offset < source.end {
+                return if end { shown.end } else { shown.start };
+            }
+            shift = shown.end as isize - source.end as isize;
+        }
+        offset.saturating_add_signed(shift)
+    }
+
+    /// The source offset of a shown one. One inside an atom lands on the
+    /// nearer end.
+    pub fn offset(&self, shown: usize) -> usize {
+        let mut shift = 0isize;
+        for (source, painted) in self.0.iter() {
+            if shown <= painted.start {
+                break;
+            }
+            if shown < painted.end {
+                return if shown - painted.start <= painted.end - shown {
+                    source.start
+                } else {
+                    source.end
+                };
+            }
+            shift = source.end as isize - painted.end as isize;
+        }
+        shown.saturating_add_signed(shift)
+    }
+}
