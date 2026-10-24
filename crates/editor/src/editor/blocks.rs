@@ -16,10 +16,12 @@ impl Editor {
             let held = this.doc.blocks[ix]
                 .text_at(Part::Body)
                 .map_or(0, |text| text.text.len());
-            this.doc.edit_at(Cursor::new(ix, Part::Body, 0), |text| {
-                *text = Text::default()
-            });
-            this.doc.set_kind(ix, kind);
+            this.doc
+                .edit()
+                .edit_at(Cursor::new(ix, Part::Body, 0), |text| {
+                    *text = Text::default()
+                });
+            this.doc.edit().set_kind(ix, kind);
             // A caret goes where the block admits one, and otherwise carries on
             // in the block after it — a fresh one when it ends the document.
             let part = this.doc.blocks[ix].parts().first().copied();
@@ -28,6 +30,7 @@ impl Editor {
                 None => {
                     if this.doc.blocks.len() <= ix + 1 {
                         this.doc
+                            .edit()
                             .blocks
                             .push(markdown::Block::new(BlockKind::Paragraph(Text::default())));
                     }
@@ -47,19 +50,25 @@ impl Editor {
     }
 
     pub(super) fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self
-            .history
-            .undo(self.mode, &self.doc, self.selection, &self.anchors)
-        {
+        let (mode, selection) = (self.mode, self.selection);
+        let step = self.document.update(cx, |document, _| {
+            document
+                .history
+                .undo(mode, &self.doc, selection, &self.anchors)
+        });
+        if let Some(step) = step {
             self.restore(step, cx);
         }
     }
 
     pub(super) fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self
-            .history
-            .redo(self.mode, &self.doc, self.selection, &self.anchors)
-        {
+        let (mode, selection) = (self.mode, self.selection);
+        let step = self.document.update(cx, |document, _| {
+            document
+                .history
+                .redo(mode, &self.doc, selection, &self.anchors)
+        });
+        if let Some(step) = step {
             self.restore(step, cx);
         }
     }
@@ -70,12 +79,15 @@ impl Editor {
     /// step back is not an edit: there is no delta between here and a document
     /// two hundred keystrokes ago.
     pub(super) fn restore(&mut self, step: crate::history::Step, cx: &mut Context<Self>) {
-        self.doc = step.doc;
+        self.doc.set(step.doc);
         self.selection = step.selection.clamp(&self.doc);
+        self.run.interrupt();
         self.caret_moved();
         self.anchors = step.anchors;
-        if step.mode != self.mode {
-            self.mode = step.mode;
+        let switched = step.mode != self.mode;
+        self.mode = step.mode;
+        self.publish(Change::Replaced, cx);
+        if switched {
             self.dismiss_menus();
             cx.emit(EditorEvent::ModeChanged(step.mode));
         }
@@ -94,7 +106,7 @@ impl Editor {
         self.edit(EditKind::Structure, cx, |this| {
             let caret = this.cursor();
             let at = this.doc.subtree(ix);
-            let Some(to) = this.doc.move_block(ix, delta) else {
+            let Some(to) = this.doc.edit().move_block(ix, delta) else {
                 return vec![];
             };
             // The caret rides along, keeping its depth within the subtree
@@ -111,7 +123,7 @@ impl Editor {
         }
         self.edit(EditKind::Structure, cx, |this| {
             let span = this.doc.subtree(ix);
-            let Some(copy) = this.doc.duplicate(ix) else {
+            let Some(copy) = this.doc.edit().duplicate(ix) else {
                 return vec![];
             };
             this.selection = Selection::at(Cursor::new(copy, Part::Body, 0).clamp(&this.doc));
@@ -128,7 +140,7 @@ impl Editor {
         }
         self.edit(EditKind::Structure, cx, |this| {
             let at = this.doc.subtree(ix);
-            this.doc.remove_block(ix);
+            this.doc.edit().remove_block(ix);
             this.selection =
                 Selection::at(Cursor::new(ix.saturating_sub(1), Part::Body, 0).clamp(&this.doc));
             vec![Delta::Moved { at, to: None }]
@@ -141,7 +153,7 @@ impl Editor {
             return;
         }
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.set_language(ix, language);
+            this.doc.edit().set_language(ix, language);
             vec![]
         });
     }
@@ -153,9 +165,166 @@ impl Editor {
             return;
         }
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.set_kind(ix, kind);
+            this.doc.edit().set_kind(ix, kind);
             this.selection = this.selection.clamp(&this.doc);
             vec![]
+        });
+    }
+
+    /// Put the block at `ix` in a quote with `alert`, or take it out of the one
+    /// it is in — see [`markdown::Doc::toggle_quote`].
+    pub fn toggle_quote(
+        &mut self,
+        ix: usize,
+        alert: Option<markdown::QuoteKind>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.blocks() {
+            return;
+        }
+        self.edit(EditKind::Structure, cx, |this| {
+            this.doc.edit().toggle_quote(ix, alert);
+            this.selection = this.selection.clamp(&this.doc);
+            vec![]
+        });
+    }
+
+    /// Replace a fenced block's code, as one undo step — what a painted fence
+    /// writes through [`markdown::Fence::rewrite`].
+    pub fn set_code(&mut self, ix: usize, code: String, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
+        self.edit(EditKind::Structure, cx, |this| {
+            this.doc.edit().set_code(ix, code);
+            this.selection = this.selection.clamp(&this.doc);
+            vec![]
+        });
+    }
+
+    /// Turn the block at `ix` into `kind` and put the caret after it — what a
+    /// [`crate::SlashAction::Run`] row does with a block the caret cannot sit
+    /// in.
+    /// The block is replaced as given, not converted: nothing of what it held
+    /// carries over.
+    pub fn place_block(&mut self, ix: usize, kind: BlockKind, cx: &mut Context<Self>) {
+        if !self.blocks() || ix >= self.doc.blocks.len() {
+            return;
+        }
+        self.edit(EditKind::Structure, cx, |this| {
+            this.doc.edit().blocks[ix].kind = kind;
+            this.selection = this.selection.clamp(&this.doc);
+            vec![]
+        });
+        self.step_past(ix, cx);
+    }
+
+    /// Put the caret at the start of the block after `ix`, making an empty
+    /// paragraph when `ix` ends the document.
+    pub(super) fn step_past(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.doc.blocks.len() <= ix + 1 {
+            self.edit(EditKind::Structure, cx, |this| {
+                this.doc
+                    .edit()
+                    .blocks
+                    .push(markdown::Block::new(BlockKind::Paragraph(Text::default())));
+                vec![]
+            });
+        }
+        let at = Cursor::new(ix + 1, Part::Body, 0).clamp(&self.doc);
+        self.select(Selection::at(at), cx);
+    }
+
+    /// Focus back from inside the painted fence at `ix`, the caret after it.
+    pub(super) fn leave_block(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+        self.step_past(ix, cx);
+    }
+
+    /// Point every picture at `from` to `to`: an image block's URL, or in
+    /// source mode each `](from)` and `](<from>)` in the text. One undo step,
+    /// and the caret keeps its place in the text around it. Nothing pointing
+    /// at `from` is no edit.
+    pub fn relink(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        if self.blocks() {
+            let found: Vec<(usize, BlockKind)> = self
+                .doc
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, block)| match &block.kind {
+                    BlockKind::Image { url, alt, width } if url == from => Some((
+                        ix,
+                        BlockKind::Image {
+                            url: to.to_owned(),
+                            alt: alt.clone(),
+                            width: *width,
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if found.is_empty() {
+                return;
+            }
+            self.edit(EditKind::Structure, cx, |this| {
+                for (ix, kind) in found {
+                    this.doc.edit().set_kind(ix, kind);
+                }
+                this.selection = this.selection.clamp(&this.doc);
+                vec![]
+            });
+            return;
+        }
+        let source = self.source_text();
+        let mut hits: Vec<(Range<usize>, String)> = [
+            (format!("]({from})"), format!("]({to})")),
+            (format!("](<{from}>)"), format!("](<{to}>)")),
+        ]
+        .into_iter()
+        .flat_map(|(old, new)| {
+            source
+                .match_indices(&old)
+                .map(|(at, _)| (at..at + old.len(), new.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+        if hits.is_empty() {
+            return;
+        }
+        // Last first, so each splice leaves the offsets before it standing.
+        hits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let moved = |cursor: Cursor| {
+            let offset = hits
+                .iter()
+                .fold(cursor.offset as isize, |at, (range, new)| {
+                    if cursor.offset >= range.end {
+                        at + new.len() as isize - range.len() as isize
+                    } else if cursor.offset > range.start {
+                        at - (cursor.offset - range.start) as isize
+                    } else {
+                        at
+                    }
+                });
+            Cursor {
+                offset: offset.max(0) as usize,
+                ..cursor
+            }
+        };
+        let selection = Selection::new(moved(self.selection.anchor), moved(self.selection.head));
+        self.edit(EditKind::Structure, cx, |this| {
+            let at = |offset| Cursor::new(0, Part::Code, offset);
+            let splices = hits
+                .iter()
+                .map(|(range, new)| {
+                    Delta::Spliced(this.doc.edit().replace(
+                        Selection::new(at(range.start), at(range.end)),
+                        Text::plain(new.as_str()),
+                    ))
+                })
+                .collect();
+            this.selection = selection.clamp(&this.doc);
+            splices
         });
     }
 
@@ -174,8 +343,12 @@ impl Editor {
             _ => return,
         };
         self.edit(EditKind::Structure, cx, |this| {
-            if let Some(BlockKind::Task { checked: at, .. }) =
-                this.doc.blocks.get_mut(ix).map(|block| &mut block.kind)
+            if let Some(BlockKind::Task { checked: at, .. }) = this
+                .doc
+                .edit()
+                .blocks
+                .get_mut(ix)
+                .map(|block| &mut block.kind)
             {
                 *at = checked;
             }
@@ -185,7 +358,7 @@ impl Editor {
         // is made where a press landed, and the caret can be pages away: the
         // reveal `edit` asked for would scroll the box being checked off the
         // screen.
-        self.reveal = false;
+        self.reveal = None;
     }
 
     /// Put an empty row in table `ix` before `row` ([`Part::Cell`]
@@ -195,7 +368,7 @@ impl Editor {
             return;
         }
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.insert_row(ix, row);
+            this.doc.edit().insert_row(ix, row);
             let row = row.max(1);
             this.selection = Selection::at(Cursor::new(ix, Part::Cell { row, column: 0 }, 0));
             vec![Delta::Cells {
@@ -227,7 +400,7 @@ impl Editor {
                 }),
         };
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.insert_column(ix, column);
+            this.doc.edit().insert_column(ix, column);
             this.selection = Selection::at(Cursor::new(ix, Part::Cell { row, column }, 0));
             vec![Delta::Cells {
                 block: ix,
@@ -320,8 +493,8 @@ impl Editor {
         }
         self.edit(EditKind::Structure, cx, |this| {
             match line {
-                Line::Row(row) => this.doc.remove_row(ix, row),
-                Line::Column(column) => this.doc.remove_column(ix, column),
+                Line::Row(row) => this.doc.edit().remove_row(ix, row),
+                Line::Column(column) => this.doc.edit().remove_column(ix, column),
             };
             this.selection = this.selection.clamp(&this.doc);
             let (row, column) = match line {

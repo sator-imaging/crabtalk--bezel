@@ -1,6 +1,7 @@
 //! The window around a section: nav, header and the body frame.
 
 use crate::*;
+use theme::AppExt as _;
 
 impl Gallery {
     /// The navigation rail: every component, one row each, the current one
@@ -27,8 +28,10 @@ impl Gallery {
             .h(px(Theme::HEADER_HEIGHT))
             .pl(px(if compact {
                 COMPACT_NAV_PAD - NAV_ITEM_PAD
-            } else {
+            } else if NAV_OVER_RAIL {
                 RAIL_WIDTH + CARD_PAD - NAV_ITEM_PAD
+            } else {
+                CARD_PAD - NAV_ITEM_PAD
             }))
             .pr(px(if APP_MENUBAR { 0.0 } else { CARD_PAD }))
             .flex()
@@ -135,14 +138,11 @@ impl Gallery {
                     .p(px(NAV_ITEM_PAD))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        appearance::set_mode(
-                            if dark {
-                                AppearanceMode::Light
-                            } else {
-                                AppearanceMode::Dark
-                            },
-                            cx,
-                        );
+                        cx.set_appearance_mode(if dark {
+                            AppearanceMode::Light
+                        } else {
+                            AppearanceMode::Dark
+                        });
                         // The probe's knobs are a look's numbers, and the two
                         // appearances do not share them: carrying dark's over
                         // paints light with dark's material and reads as the
@@ -301,12 +301,12 @@ impl Render for Gallery {
         let body = self.body(section, window, cx);
         let pane = div().relative().flex_1().min_h_0().map(|pane| {
             if TABS[self.tab].full_bleed {
-                // A pattern is a screen: it takes the pane whole and
+                // A full-bleed page is a screen: it takes the pane whole and
                 // scrolls its own parts, so neither the fixed column nor
                 // the pane's own scrollbar applies to it.
                 //
                 // Narrower than a screen it stays one anyway, and you pan
-                // across it — a pattern is a file you copy into a desktop app,
+                // across it — a page is a file you copy into a desktop app,
                 // and thirteen phone layouts of one document nothing.
                 pane.child(
                     div()
@@ -350,44 +350,50 @@ impl Render for Gallery {
             // header — repeating them inside it would be the same chrome twice.
             div().flex().flex_col().size_full().child(pane)
         } else {
-            div()
+            let rail = (!compact).then(|| self.rail.clone().cached(rail::style()));
+            let card = div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
                 .flex()
                 .flex_col()
-                .size_full()
-                .child(self.nav(&theme, compact, window, cx))
-                .child(
+                .bg(theme.surface)
+                .overflow_hidden()
+                // Runs off the window's right and bottom edges, so the only
+                // corner that floats is the one that gets rounded. The seam it
+                // rounds against is the rail, so a drawer leaves it nothing to
+                // round and the pane meets the window edge.
+                .when(!compact, |card| {
+                    card.rounded_tl(px(Theme::panel_radius()))
+                        .border_t_1()
+                        .border_l_1()
+                        .border_color(theme.border)
+                })
+                .child(self.header(section, &theme))
+                .child(pane);
+            let nav = self.nav(&theme, compact, window, cx);
+            if NAV_OVER_RAIL || compact {
+                div().flex().flex_col().size_full().child(nav).child(
                     div()
                         .flex_1()
                         .min_h_0()
                         .flex()
                         .flex_row()
-                        .when(!compact, |row| {
-                            row.child(self.rail.clone().cached(rail::style()))
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(theme.surface)
-                                .overflow_hidden()
-                                // Runs off the window's right and bottom edges,
-                                // so the only corner that floats is the one
-                                // that gets rounded. The seam it rounds against
-                                // is the rail, so a drawer leaves it nothing to
-                                // round and the pane meets the window edge.
-                                .when(!compact, |card| {
-                                    card.rounded_tl(px(Theme::panel_radius()))
-                                        .border_t_1()
-                                        .border_l_1()
-                                        .border_color(theme.border)
-                                })
-                                .child(self.header(section, &theme))
-                                .child(pane),
-                        ),
+                        .children(rail)
+                        .child(card),
                 )
+            } else {
+                div().flex().flex_row().size_full().children(rail).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(nav)
+                        .child(div().flex_1().min_h_0().flex().flex_row().child(card)),
+                )
+            }
         };
 
         // Traversal goes on the root so `tab` works wherever focus happens to
@@ -403,9 +409,16 @@ impl Render for Gallery {
             .on_action(cx.listener(Self::close_overlay))
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(|view, event: &gpui::MouseDownEvent, _, cx| {
-                    view.context_menu.open(event.position);
-                    cx.notify();
+                cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
+                    let items = ["Cut", "Copy", "Paste"].map(Item::action).to_vec();
+                    view.context_menu.open(
+                        Demo::Pointer,
+                        Place::At(event.position),
+                        items,
+                        |_, _, _, _| {},
+                        window,
+                        cx,
+                    );
                 }),
             )
             .size_full()
@@ -466,43 +479,13 @@ impl Render for Gallery {
                     ))
                 },
             )
-            .when_some(
-                self.context_menu
-                    .get()
-                    .copied()
-                    .map(|position| (position, self.context_menu.closing_since())),
-                |root, (position, closing)| {
-                    root.child(popover::menu_at(
-                        "gallery-context",
-                        position,
-                        popover::popover_card(&theme)
-                            .w(px(180.0))
-                            .children(["Cut", "Copy", "Paste"].iter().enumerate().map(
-                                |(index, label)| {
-                                    popover::menu_row(
-                                        &theme,
-                                        false,
-                                        Some(Fade::new(view, format!("ctx-{index}"))),
-                                    )
-                                    .id(SharedString::from(format!("ctx-item-{index}")))
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.close_context_menu(cx)),
-                                    )
-                                    .child(*label)
-                                    .into_any_element()
-                                },
-                            ))
-                            // Dismissal is the caller's, and this is that
-                            // caller: press anywhere off the card and the menu
-                            // goes away.
-                            .on_mouse_down_out(
-                                cx.listener(|view, _, _, cx| view.close_context_menu(cx)),
-                            )
-                            .into_any_element(),
-                        closing,
-                    ))
-                },
-            )
+            .children(self.context_menu.render_for(
+                &Demo::Pointer,
+                "gallery-context",
+                |view| &mut view.context_menu,
+                window,
+                cx,
+            ))
             .when(self.dialog.get().is_some(), |root| {
                 root.child(popover::modal(
                     "gallery-dialog",

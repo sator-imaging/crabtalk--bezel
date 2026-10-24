@@ -83,6 +83,9 @@ pub fn init(cx: &mut App) {
 /// chord to take it away, or skip [`init`] and bind a filtered `bindings()`.
 /// Either way the actions are public and [`CONTEXT`] names the scope, so what
 /// the editor answers to is the app's to say.
+///
+/// [`MoveBlockUp`], [`MoveBlockDown`], [`DuplicateBlock`] and [`RemoveBlock`]
+/// have no chord.
 pub fn bindings() -> Vec<KeyBinding> {
     let ctx = Some(CONTEXT);
     let mut bindings = Vec::new();
@@ -214,6 +217,28 @@ pub fn bindings() -> Vec<KeyBinding> {
         // reads it as "insert link", and a chord with two meanings is one this
         // library does not get to claim.
     ]);
+
+    // Inside a painted fence every chord above is taken away, so a control the
+    // block paints keeps what it does not bind itself, and escape leaves it.
+    let painted = Some(markdown::PAINTED_CONTEXT);
+    let mut taken: Vec<String> = Vec::new();
+    for binding in &bindings {
+        let chord = binding
+            .keystrokes()
+            .iter()
+            .map(|keystroke| keystroke.unparse())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if chord != "escape" && !taken.contains(&chord) {
+            taken.push(chord);
+        }
+    }
+    bindings.extend(
+        taken
+            .iter()
+            .map(|chord| KeyBinding::new(chord, gpui::NoAction, painted)),
+    );
+    bindings.push(KeyBinding::new("escape", markdown::LeaveBlock, painted));
 
     bindings
 }

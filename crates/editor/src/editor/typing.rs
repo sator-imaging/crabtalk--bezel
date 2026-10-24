@@ -1,6 +1,7 @@
 //! Typing, deletion, block splits, indent and text size.
 
 use super::*;
+use crate::AppExt as _;
 
 impl Editor {
     /// Replace whatever is selected with `text`, applying a markdown prefix if
@@ -9,6 +10,8 @@ impl Editor {
     /// Typing, backspace, delete and IME all land here, so none of them has to
     /// ask whether a selection was empty.
     pub(super) fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let items = crate::slash::installed(cx);
+        let trigger = crate::mention::Installed::source(cx, text);
         self.edit(EditKind::Insert, cx, |this| {
             let mut typed = Text::plain(text);
             // A stored mark applies to what is typed next and to nothing else,
@@ -19,12 +22,13 @@ impl Editor {
                     mark,
                 });
             }
-            let splice = this.doc.replace(this.selection, typed);
+            let splice = this.doc.edit().replace(this.selection, typed);
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
             let shortcut = this.apply_shortcut();
             let promoted = this.promote_quote_marker();
             let inline = this.apply_inline_rule();
-            this.track_slash(text);
+            this.track_slash(text, items);
+            this.track_mention(trigger);
             std::iter::once(Delta::Spliced(splice))
                 .chain(shortcut)
                 .chain(promoted)
@@ -38,7 +42,7 @@ impl Editor {
     /// The query is the text between the `/` and the caret, so there is no
     /// second field and no focus to hand over — typing filters because typing
     /// is what it already was.
-    pub(super) fn track_slash(&mut self, typed: &str) {
+    pub(super) fn track_slash(&mut self, typed: &str, items: Vec<crate::SlashItem>) {
         if !self.chrome.slash {
             return;
         }
@@ -63,10 +67,13 @@ impl Editor {
             // Only in a body: a fence holds its slash literally, and a caption
             // belongs to a block that is already what it is.
             if let Some(slash) = opened.filter(|_| starts_word && at.part == Part::Body) {
-                self.slash = Some(Slash::open(Cursor {
-                    offset: slash,
-                    ..at
-                }));
+                self.slash = Some(Slash::open(
+                    Cursor {
+                        offset: slash,
+                        ..at
+                    },
+                    items,
+                ));
             }
             return;
         }
@@ -82,32 +89,113 @@ impl Editor {
         }
     }
 
+    /// Open the mention menu on `typed`, a trigger just typed, when it starts
+    /// a word, and keep its query in step afterwards — [`Self::track_slash`]'s
+    /// rules.
+    pub(super) fn track_mention(&mut self, typed: Option<(char, crate::MentionSource)>) {
+        if !self.chrome.mention {
+            return;
+        }
+        let at = self.cursor();
+        let text = self
+            .doc
+            .blocks
+            .get(at.block)
+            .and_then(|block| block.text_at(at.part))
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        let Some(menu) = &mut self.mention else {
+            let opened = typed.and_then(|typed| {
+                let sign = at.offset.checked_sub(typed.0.len_utf8())?;
+                let starts_word = text[..sign]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace);
+                (starts_word && at.part == Part::Body).then_some((sign, typed))
+            });
+            if let Some((sign, source)) = opened {
+                self.mention = Some(crate::mention::MentionMenu::open(
+                    Cursor { offset: sign, ..at },
+                    source,
+                ));
+            }
+            return;
+        };
+        let start = menu.at.offset + menu.trigger.len_utf8();
+        let query = (at.block == menu.at.block && at.part == menu.at.part && at.offset >= start)
+            .then(|| text.get(start..at.offset))
+            .flatten()
+            .filter(|query| !query.contains(char::is_whitespace));
+        match query {
+            Some(query) => menu.set_query(query.to_owned()),
+            None => self.mention = None,
+        }
+    }
+
+    /// Replace the trigger and query with a chip linking the row at `ix`, or the live
+    /// one, and a space after it.
+    pub(super) fn confirm_mention(&mut self, ix: Option<usize>, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.mention.take() else {
+            return false;
+        };
+        let Some(row) = menu.row(ix).cloned() else {
+            cx.notify();
+            return true;
+        };
+        let (at, caret) = (menu.at, self.cursor());
+        let chip = Text {
+            text: format!("{} ", row.url),
+            marks: vec![markdown::MarkSpan {
+                range: 0..row.url.len(),
+                mark: markdown::Mark::Mention {
+                    url: row.url.clone(),
+                    form: markdown::Form::Chip,
+                },
+            }],
+        };
+        self.edit(EditKind::Insert, cx, |this| {
+            let splice = this.doc.edit().replace(Selection::new(at, caret), chip);
+            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            vec![Delta::Spliced(splice)]
+        });
+        true
+    }
+
     /// Take the highlighted block, replacing the `/query` that summoned it.
     /// Take `kind`, or the highlighted row when the caller names none — Enter
     /// and a click are the same operation with a different source.
     pub(super) fn confirm_slash(
         &mut self,
-        kind: Option<BlockKind>,
+        path: Option<Vec<usize>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(slash) = &mut self.slash else {
             return false;
         };
-        if kind.is_none() && slash.on_group() {
+        if path.is_none() && slash.on_group() {
             slash.descend();
             cx.notify();
             return true;
         }
-        let (at, kind) = (slash.at, kind.or_else(|| slash.choice()));
+        let Some(path) = path.or_else(|| slash.cursor.path()) else {
+            return false;
+        };
+        let (at, action) = (slash.at, slash.action_at(&path));
         self.slash = None;
-        let Some(kind) = kind else {
+        let Some(action) = action else {
             return false;
         };
         let caret = self.cursor();
         self.edit(EditKind::Structure, cx, |this| {
             this.doc
+                .edit()
                 .edit_at(at, |text| text.remove(at.offset..caret.offset));
-            this.doc.set_kind(at.block, kind);
+            match &action {
+                SlashAction::Block(kind) => this.doc.edit().set_kind(at.block, kind.clone()),
+                SlashAction::Quote(alert) => this.doc.edit().toggle_quote(at.block, *alert),
+                SlashAction::Run(_) => {}
+            }
             this.selection =
                 Selection::at(Cursor::new(at.block, Part::Body, at.offset).clamp(&this.doc));
             vec![Delta::Spliced(Splice {
@@ -116,6 +204,20 @@ impl Editor {
                 blocks: 0,
             })]
         });
+        if let SlashAction::Run(run) = action {
+            // After this update ends: the app edits this editor.
+            let editor = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                run(
+                    SlashAt {
+                        editor,
+                        block: at.block,
+                    },
+                    window,
+                    cx,
+                )
+            });
+        }
         true
     }
 
@@ -143,7 +245,7 @@ impl Editor {
         };
         let width = open.len();
         let (opening, closing) = (open.clone(), inner.end..at.offset);
-        self.doc.edit_at(at, |text| {
+        self.doc.edit().edit_at(at, |text| {
             // The closing delimiter first — taking the opening one would move
             // every offset after it.
             text.remove(inner.end..at.offset);
@@ -160,6 +262,11 @@ impl Editor {
     /// Add `mark` over the selection, or take it away if the whole selection
     /// already carries it. Public because a toolbar reaches the same operation
     /// the key does.
+    ///
+    /// At a collapsed caret the mark is stored for the next character typed.
+    /// [`Mark::Code`] over a [`Formatting::fenceable`] selection makes a fence,
+    /// and with the caret in a fence takes the code back out. Does nothing in
+    /// [`Mode::Source`].
     pub fn toggle_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
         // Nothing in the source is a mark: the markup is already spelled out,
         // and cmd-B over `**bold**` would fence what it reads.
@@ -195,18 +302,18 @@ impl Editor {
                 })]
             };
             if matches!(mark, Mark::Code) {
-                if let Some(head) = this.doc.unfence(selection) {
+                if let Some(head) = this.doc.edit().unfence(selection) {
                     this.selection = Selection::at(head.clamp(&this.doc));
                     return refenced(&this.doc, head);
                 }
                 if fenceable(&this.doc, selection) {
-                    let head = this.doc.fence(selection);
+                    let head = this.doc.edit().fence(selection);
                     this.selection = Selection::at(head.clamp(&this.doc));
                     return refenced(&this.doc, head);
                 }
             }
             // A mark is paint over text that does not move.
-            this.doc.toggle_mark(selection, mark);
+            this.doc.edit().toggle_mark(selection, mark);
             vec![]
         });
     }
@@ -223,33 +330,34 @@ impl Editor {
         if at.part != Part::Body {
             return None;
         }
-        // Only a paragraph turns: in a heading, list item or quote the prefix
-        // is text.
+        // Only a paragraph turns: in a heading or list item the prefix is
+        // text. `> ` quotes any block not already in a quote.
         let block = self.doc.blocks.get(at.block)?;
-        if !matches!(block.kind, BlockKind::Paragraph(_)) {
-            return None;
-        }
         let text = block.text_at(Part::Body)?;
         // Only from the very start of a block, and only up to the caret: a
         // `- ` typed in the middle of a sentence is a hyphen.
         let (hit, len) = shortcut(&text.text)?;
-        if at.offset < len {
+        let turns = match hit {
+            markdown::Shortcut::Quote => block.quote.is_none(),
+            _ => matches!(block.kind, BlockKind::Paragraph(_)),
+        };
+        if !turns || at.offset < len {
             return None;
         }
         // Strip the prefix, then turn the block — the same two steps the slash
         // menu takes, so a `## ` and a menu pick land in one place.
-        self.doc.edit_at(at, |text| text.remove(0..len));
-        self.doc.set_kind(at.block, hit.apply(Text::default()));
+        self.doc.edit().edit_at(at, |text| text.remove(0..len));
+        self.doc.edit().apply(at.block, hit);
         self.selection =
             Selection::at(Cursor::new(at.block, Part::Body, at.offset - len).clamp(&self.doc));
         // The transformation is its own step: undo after typing `## Title`
         // should give back the heading, not the paragraph before the hashes.
-        self.history.interrupt();
+        self.run.interrupt();
         Some(Self::taken(at, 0..len))
     }
 
-    /// Promote a quote whose first line is a GFM alert marker into the alert
-    /// block kind the parser would have produced from the same markdown.
+    /// Promote a quote whose block opens with a GFM alert marker into the
+    /// alert the parser would have produced from the same markdown.
     ///
     /// The marker line goes the way a block shortcut's prefix does, so what was
     /// written under it stays as the alert's body.
@@ -259,7 +367,7 @@ impl Editor {
             return None;
         }
         let block = self.doc.blocks.get(at.block)?;
-        if !matches!(block.kind, BlockKind::Quote { kind: None, .. }) {
+        if block.quote.is_none_or(|quote| quote.alert.is_some()) {
             return None;
         }
         let text = &block.text_at(Part::Body)?.text;
@@ -267,18 +375,12 @@ impl Editor {
         let kind = Self::quote_marker(first)?;
         // The marker line, and the break after it where a body follows.
         let len = first.len() + usize::from(text.len() > first.len());
-        self.doc.edit_at(at, |text| text.remove(0..len));
-        self.doc.set_kind(
-            at.block,
-            BlockKind::Quote {
-                kind: Some(kind),
-                text: Text::default(),
-            },
-        );
+        self.doc.edit().edit_at(at, |text| text.remove(0..len));
+        self.doc.edit().set_alert(at.block, Some(kind));
         self.selection = Selection::at(
             Cursor::new(at.block, Part::Body, at.offset.saturating_sub(len)).clamp(&self.doc),
         );
-        self.history.interrupt();
+        self.run.interrupt();
         Some(Self::taken(at, 0..len))
     }
 
@@ -287,10 +389,7 @@ impl Editor {
     pub(super) fn taken(at: Cursor, range: Range<usize>) -> Delta {
         let start = Cursor::new(at.block, at.part, range.start);
         Delta::Spliced(Splice {
-            removed: Selection {
-                anchor: start,
-                head: Cursor::new(at.block, at.part, range.end),
-            },
+            removed: Selection::new(start, Cursor::new(at.block, at.part, range.end)),
             caret: start,
             blocks: 0,
         })
@@ -328,15 +427,17 @@ impl Editor {
         self.edit(kind, cx, |this| {
             let before = this.doc.blocks.len();
             let splice = if !this.selection.is_collapsed() {
-                this.doc.replace(this.selection, Text::default())
+                this.doc.edit().replace(this.selection, Text::default())
             } else if at.offset > 0 {
+                let from = at.left(&this.doc);
                 this.doc
-                    .replace(Selection::new(at.left(&this.doc), at), Text::default())
+                    .edit()
+                    .replace(Selection::new(from, at), Text::default())
             } else {
                 // `merge_back` outdents, unmarkers, unfences or merges —
                 // whichever the block's state calls for — and says where the
                 // caret landed.
-                match this.doc.merge_back(at) {
+                match this.doc.edit().merge_back(at) {
                     // The seam between where the caret was and where it landed
                     // is exactly what the merge closed up.
                     Some(head) => Splice {
@@ -351,7 +452,8 @@ impl Editor {
             this.selection = Selection::at(head.clamp(&this.doc));
             // Deleting narrows the query too, and backspacing onto the slash
             // itself is what closes the menu.
-            this.track_slash("");
+            this.track_slash("", Vec::new());
+            this.track_mention(None);
             vec![Delta::Spliced(splice)]
         });
     }
@@ -370,7 +472,7 @@ impl Editor {
             } else {
                 this.selection
             };
-            let splice = this.doc.replace(range, Text::default());
+            let splice = this.doc.edit().replace(range, Text::default());
             this.selection = Selection::at(splice.caret.clamp(&this.doc));
             vec![Delta::Spliced(splice)]
         });
@@ -381,12 +483,20 @@ impl Editor {
     /// Every Enter chord asks first, or picking a block would also edit the one
     /// it is turning — and a chord the menu never sees leaves it open over a
     /// query the caret has walked away from.
-    pub(super) fn menu_took_enter(&mut self, cx: &mut Context<Self>) -> bool {
-        if let Some(choice) = self.pasted.as_ref().map(link::Paste::choice) {
-            self.confirm_paste(choice, cx);
+    pub(super) fn menu_took_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(pasted) = &self.pasted {
+            if let Some(choice) = pasted.choice(None) {
+                self.confirm_paste(choice, cx);
+            }
             return true;
         }
-        self.confirm_slash(None, cx)
+        if self.dropdown_enter(window, cx) {
+            return true;
+        }
+        if self.mention.is_some() {
+            return self.confirm_mention(None, cx);
+        }
+        self.confirm_slash(None, window, cx)
     }
 
     /// Enter. In a body it splits the block; in a code fence it is a newline,
@@ -397,7 +507,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.menu_took_enter(cx) {
+        if self.menu_took_enter(window, cx) {
             return;
         }
         let at = self.cursor();
@@ -423,15 +533,28 @@ impl Editor {
             // which is [`Doc::split`]'s answer for a block with no body.
             Part::Caption | Part::Body => {}
         }
+        // Enter in an empty block steps out of whatever holds it.
+        let empty = self.selection.is_collapsed()
+            && at.part == Part::Body
+            && self
+                .doc
+                .blocks
+                .get(at.block)
+                .and_then(|block| block.text_at(Part::Body))
+                .is_some_and(Text::is_empty);
         self.edit(EditKind::Structure, cx, |this| {
+            if empty && this.doc.edit().peel(at.block) {
+                this.selection = Selection::at(at.clamp(&this.doc));
+                return vec![];
+            }
             let mut deltas = Vec::new();
             if !this.selection.is_collapsed() {
-                let splice = this.doc.replace(this.selection, Text::default());
+                let splice = this.doc.edit().replace(this.selection, Text::default());
                 this.selection = Selection::at(splice.caret.clamp(&this.doc));
                 deltas.push(Delta::Spliced(splice));
             }
             let at = this.cursor();
-            let new = this.doc.split(at.block, at.offset);
+            let new = this.doc.edit().split(at.block, at.offset);
             this.selection = Selection::at(Cursor::new(new, Part::Body, 0).clamp(&this.doc));
             // What followed the caret moved into a block of its own, which
             // everything below it now sits under.
@@ -446,8 +569,13 @@ impl Editor {
 
     /// Shift+Enter. In prose it keeps the caret in the block and inserts a
     /// literal newline; the places markdown itself keeps to one line still do.
-    pub(super) fn soft_break(&mut self, _: &SoftBreak, _: &mut Window, cx: &mut Context<Self>) {
-        if self.menu_took_enter(cx) {
+    pub(super) fn soft_break(
+        &mut self,
+        _: &SoftBreak,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.menu_took_enter(window, cx) {
             return;
         }
         match self.cursor().part {
@@ -461,10 +589,10 @@ impl Editor {
     pub(super) fn insert_paragraph(
         &mut self,
         _: &InsertParagraph,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.menu_took_enter(cx) {
+        if self.menu_took_enter(window, cx) {
             return;
         }
         if !self.blocks() {
@@ -474,11 +602,11 @@ impl Editor {
             let at = this.cursor().block;
             let insert_at = this.doc.subtree(at).end;
             let indent = this.doc.blocks.get(at).map_or(0, |block| block.indent);
-            this.doc.blocks.insert(
+            this.doc.edit().blocks.insert(
                 insert_at,
                 Block::at(BlockKind::Paragraph(Text::default()), indent),
             );
-            this.doc.repair();
+            this.doc.edit().repair();
             this.selection = Selection::at(Cursor::new(insert_at, Part::Body, 0).clamp(&this.doc));
             vec![Delta::Opened {
                 at: insert_at,
@@ -497,7 +625,8 @@ impl Editor {
             return;
         }
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.indent(this.cursor().block);
+            let block = this.cursor().block;
+            this.doc.edit().indent(block);
             vec![]
         });
     }
@@ -510,7 +639,8 @@ impl Editor {
             return;
         }
         self.edit(EditKind::Structure, cx, |this| {
-            this.doc.outdent(this.cursor().block);
+            let block = this.cursor().block;
+            this.doc.edit().outdent(block);
             vec![]
         });
     }
@@ -521,7 +651,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.step_text_size(TextSize::of(cx).step, cx);
+        self.step_text_size(cx.editor_text_size().step, cx);
     }
 
     pub(super) fn decrease_text_size(
@@ -530,7 +660,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.step_text_size(-TextSize::of(cx).step, cx);
+        self.step_text_size(-cx.editor_text_size().step, cx);
     }
 
     pub(super) fn reset_text_size(
@@ -539,7 +669,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        text_size::reset_text_size(cx);
+        cx.reset_editor_text_size();
     }
 
     /// Sizing is not an edit: it changes nothing about the document, so it
@@ -550,14 +680,25 @@ impl Editor {
     /// to work back through on the way down.
     pub(super) fn step_text_size(&mut self, by: f32, cx: &mut Context<Self>) {
         let base = self.text_size.unwrap_or_else(theme::base_text_size);
-        let next = TextSize::of(cx).clamp(text_size::resolve(self.text_size, cx) + by);
+        let next = cx
+            .editor_text_size()
+            .clamp(text_size::resolve(self.text_size, cx) + by);
         text_size::set_adjustment(next - base, cx);
     }
 
     /// Escape closes an open menu, and otherwise collapses a selection — the
     /// things there are to back out of, innermost first.
     pub(super) fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.pasted.take().is_none() && self.slash.take().is_none() {
+        if self.table_drag.take().is_some() {
+            self.table_dragged = true;
+            cx.notify();
+            return;
+        }
+        if self.pasted.take().is_none()
+            && self.slash.take().is_none()
+            && self.mention.take().is_none()
+            && !self.dropdown_dismiss(cx)
+        {
             self.selection = Selection::at(self.selection.head);
         }
         cx.notify();

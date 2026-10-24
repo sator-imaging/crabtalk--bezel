@@ -64,13 +64,6 @@ impl State {
 
 pub(super) fn start(_window: &Window, _cx: &mut App) {}
 
-pub(super) fn build(
-    builder: wry::WebViewBuilder<'_>,
-    window: &Window,
-) -> Option<wry::Result<wry::WebView>> {
-    Some(builder.build_as_child(window))
-}
-
 /// Store identifiers are macOS's.
 pub(super) fn store<'a>(
     builder: wry::WebViewBuilder<'a>,
@@ -111,6 +104,11 @@ pub(super) fn forward(view: &wry::WebView) {
 }
 
 /// Through the DevTools protocol: WebView2 has no reload that skips the cache.
+#[cfg(feature = "inspector")]
+pub(super) fn open_inspector(view: &wry::WebView) {
+    view.open_devtools();
+}
+
 pub(super) fn reload_bypassing_cache(view: &wry::WebView) {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2CallDevToolsProtocolMethodCompletedHandler;
     use windows::core::w;

@@ -34,32 +34,38 @@
 //!
 //! Installed as a gpui [`Global`](gpui::Global) at boot; read with [`Theme::of`].
 
+mod app;
+pub use app::AppExt;
+
 pub mod appearance;
 
 mod brand;
 mod color;
 mod paint;
 mod platform;
+mod selection;
 mod theme;
 
-pub use brand::{BASE_COLORS, Brand, Ink, TextInk, Tint, Vibrancy, brand, set_brand};
+pub use brand::{BASE_COLORS, Brand, Ink, TextInk, Tint, Vibrancy};
 
-pub use platform::{LENSED, frosted_window};
+pub use platform::{LENSED, behind_window_blending};
+
+pub use selection::Selection;
 
 pub use color::{
-    contrast_ratio, flatten, grey, hsl_to_rgb, lightness, mix, neutral, oklch, oklch_to_srgb,
-    relative_luminance, rgb_to_hsl, tint,
+    LEGIBLE, contrast_ratio, flatten, grey, hsl_to_rgb, ink_over, kept, legible, legible_on,
+    lightness, mix, mix_oklab, neutral, oklch, oklch_to_srgb, over, relative_luminance, rgb_to_hsl,
+    stack, tint,
 };
 pub use paint::{
     INK_FILL_SCALE, INK_HAIRLINE_SCALE, SCRIM_ALPHA_DARK, band, card_selected_bg,
-    card_selected_shadows, current_appearance, frame_shadows, glass_selected_bg,
+    card_selected_shadows, content_shadows, current_appearance, frame_shadows, glass_selected_bg,
     glass_selected_shadows, hairline, ink, lock_appearance, scrim, set_current_appearance,
     surface_shadows, theme_generation, user_bubble_bg, wash,
 };
 pub use theme::{
-    ControlSize, Glass, HighlightKind, Material, MaterialSpec, Metrics, Sizing, SurfaceSpec,
-    SurfaceStyle, SyntaxPalette, TextStyle, Theme, Typeset, base_text_size, set_base_text_size,
-    set_palette,
+    ControlSize, Glass, HighlightKind, Material, MaterialSpec, Metrics, Seed, Sizing, SurfaceSpec,
+    SurfaceStyle, SyntaxPalette, TextStyle, Theme, ThemeFamily, Typeset, Variant, base_text_size,
 };
 
 /// The carrier seam for catalog traits: any type holding a [`Theme`] exposes

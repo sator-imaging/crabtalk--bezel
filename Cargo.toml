@@ -8,13 +8,14 @@ members = [
     "crates/ui",
     "crates/icons",
     "crates/syntax",
-    "crates/syntax-std",
     "crates/markdown",
     "crates/blocks",
     "crates/editor",
     "crates/terminal",
     "crates/canvas",
+    "crates/chart",
     "crates/browser",
+    "crates/mermaid",
     "apps/gallery",
     "apps/web",
     "apps/hello",
@@ -23,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.20"
 edition = "2024"
 license = "MIT"
 authors = ["clearloop <tianyi.gc@gmail.com>"]
@@ -37,20 +38,21 @@ rust-version = "1.90"
 [workspace.dependencies]
 # The short names are taken on crates.io, so packages publish as `bezel-*`; the
 # key here and each crate's `[lib] name` are what the source imports.
-bezel = { path = "crates/bezel", version = "0.2.4" }
-agent = { package = "bezel-agent", path = "crates/agent", version = "0.2.4" }
-theme = { package = "bezel-theme", path = "crates/theme", version = "0.2.4" }
-motion = { package = "bezel-motion", path = "crates/motion", version = "0.2.4" }
-ui = { package = "bezel-ui", path = "crates/ui", version = "0.2.4" }
-icons = { package = "bezel-icons", path = "crates/icons", version = "0.2.4" }
-markdown = { package = "bezel-markdown", path = "crates/markdown", version = "0.2.4" }
-blocks = { package = "bezel-blocks", path = "crates/blocks", version = "0.2.4" }
-editor = { package = "bezel-editor", path = "crates/editor", version = "0.2.4" }
-syntax = { package = "bezel-syntax", path = "crates/syntax", version = "0.2.4" }
-syntax-std = { package = "bezel-syntax-std", path = "crates/syntax-std", version = "0.2.4" }
-terminal = { package = "bezel-terminal", path = "crates/terminal", version = "0.2.4" }
-canvas = { package = "bezel-canvas", path = "crates/canvas", version = "0.2.4" }
-browser = { package = "bezel-browser", path = "crates/browser", version = "0.2.4" }
+bezel = { path = "crates/bezel", version = "0.2.20" }
+agent = { package = "bezel-agent", path = "crates/agent", version = "0.2.20" }
+theme = { package = "bezel-theme", path = "crates/theme", version = "0.2.20" }
+motion = { package = "bezel-motion", path = "crates/motion", version = "0.2.20" }
+ui = { package = "bezel-ui", path = "crates/ui", version = "0.2.20" }
+icons = { package = "bezel-icons", path = "crates/icons", version = "0.2.20" }
+markdown = { package = "bezel-markdown", path = "crates/markdown", version = "0.2.20" }
+mermaid = { package = "bezel-mermaid", path = "crates/mermaid", version = "0.2.20" }
+blocks = { package = "bezel-blocks", path = "crates/blocks", version = "0.2.20" }
+editor = { package = "bezel-editor", path = "crates/editor", version = "0.2.20" }
+syntax = { package = "bezel-syntax", path = "crates/syntax", version = "0.2.20" }
+terminal = { package = "bezel-terminal", path = "crates/terminal", version = "0.2.20" }
+canvas = { package = "bezel-canvas", path = "crates/canvas", version = "0.2.20" }
+chart = { package = "bezel-chart", path = "crates/chart", version = "0.2.20" }
+browser = { package = "bezel-browser", path = "crates/browser", version = "0.2.20" }
 # An app rather than a library: `apps/web` renders the same catalog, and
 # nothing publishes it.
 gallery = { path = "apps/gallery" }
@@ -75,8 +77,19 @@ tree-sitter-css = "0.25"
 # The parser gpui paints SVGs with, used by the icon tests to prove a generated
 # document renders rather than merely looking like markup.
 usvg = "0.46"
+# gpui's rasterizer, at its version: a mermaid fence draws with it.
+resvg = { version = "0.46", default-features = false, features = ["text", "raster-images"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_repr = "0.1"
+serde_with = "3"
+toml = "0.8"
+indexmap = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+memchr = "2"
+rustybuzz = "0.20"
+wasm-bindgen = "0.2"
+image = { version = "0.25", default-features = false }
 tracing = "0.1"
 
 # Our zed fork, published from crabtalk/zed; the keys are what the source imports.
@@ -85,6 +98,8 @@ gpui_platform = { git = "https://github.com/crabtalk/zed", version = ">=0.1.0", 
     "font-kit",
 ] }
 gpui_web      = { git = "https://github.com/crabtalk/zed", version = ">=0.1.0" }
+# What `gpui::SharedString` re-exports, for a crate that builds without gpui.
+gpui_shared_string = { package = "bezel-gpui-shared-string", version = "0.3.20" }
 
 [workspace.lints.rust]
 # The objc 0.2 macros expand `cfg(feature = "cargo-clippy")` checks; declare
@@ -99,6 +114,10 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# Timed for speed, where release is built for size.
+[profile.bench]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"
