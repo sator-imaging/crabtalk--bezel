@@ -1,6 +1,7 @@
+use markdown::parse::parse;
 use markdown::*;
 
-use markdown::parse::parse;
+mod common;
 
 /// Markdown already in the form this serializer emits. These must survive
 /// byte for byte — anything less means opening a note and saving it without
@@ -176,9 +177,35 @@ fn code_containing_a_fence_gets_a_longer_one() {
         blocks: vec![Block::new(BlockKind::Code {
             language: None,
             code: Text::plain("```\nnested\n```"),
+            height: None,
         })],
     };
     assert_eq!(parse(&serialize(&doc)), doc);
+}
+
+#[test]
+fn a_fence_keeps_its_height_after_the_language() {
+    let source = "```mermaid 360\ngraph TD\n```";
+    let doc = parse(source);
+    assert!(matches!(
+        &doc.blocks[0].kind,
+        BlockKind::Code { language: Some(language), height: Some(360), .. } if language == "mermaid"
+    ));
+    assert_eq!(serialize(&doc), source);
+}
+
+#[test]
+fn an_embed_keeps_its_height_in_the_title() {
+    let source = "[cydonia://a#4](cydonia://a#4 \"embed 320\")";
+    let doc = parse(source);
+    assert!(matches!(
+        &doc.blocks[0].kind,
+        BlockKind::Bookmark {
+            form: markdown::Form::Embed(Some(320)),
+            ..
+        }
+    ));
+    assert_eq!(serialize(&doc), source);
 }
 
 #[test]
@@ -219,83 +246,13 @@ fn an_empty_document_serializes_to_nothing() {
     assert_eq!(parse(""), Doc::default());
 }
 
-/// Line fragments to shuffle into documents no one would think to write.
-/// The point of the generative test is exactly the combinations a
-/// hand-written corpus misses, so the awkward ones earn their place here.
-const FRAGMENTS: &[&str] = &[
-    "# h",
-    "###### deep",
-    "text",
-    "- a",
-    "- b",
-    "1. a",
-    "2. b",
-    "9) paren",
-    "> q",
-    "```",
-    "```rust",
-    "    indented",
-    "| a | b |",
-    "| --- | ---: |",
-    "| 1 | 2 |",
-    "---",
-    "***",
-    "",
-    "    - nested",
-    "        deep cont",
-    "- [ ] t",
-    "- [x] d",
-    "**bold** tail",
-    "_it_ tail",
-    "`code` tail",
-    "[l](u) tail",
-    "![](i)",
-    "![alt](i)",
-    "[l](<a b>)",
-    "![](<a b.png>)",
-    "[l](a(b)c)",
-    "a*b",
-    "a_b_c",
-    "#123",
-    "1 < 2 & 3",
-    "AT&T",
-    "\\# escaped",
-    "~~s~~",
-    "   ",
-    "> - x",
-    "- > x",
-    "<div>",
-    "a <span> b",
-    "trailing \\",
-    "**unclosed",
-    "| ragged |",
-    "setext",
-    "======",
-    "> [!TIP]",
-    "> [!NOTE]",
-    "> [!BOGUS]",
-    "> \\[!TIP\\]",
-];
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> usize {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as usize
-    }
-}
-
 #[test]
 fn the_fixed_point_holds_for_generated_documents() {
-    let mut rng = Rng(0x5eed);
+    let mut rng = common::Rng(0x5eed);
     for case in 0..20_000 {
         let lines = 1 + rng.next() % 8;
         let source = (0..lines)
-            .map(|_| FRAGMENTS[rng.next() % FRAGMENTS.len()])
+            .map(|_| common::LINES[rng.next() % common::LINES.len()])
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -317,14 +274,15 @@ fn the_fixed_point_holds_for_generated_documents() {
 }
 
 #[test]
-fn an_alert_is_a_block_kind_rather_than_text() {
+fn an_alert_is_the_quote_rather_than_text() {
     let doc = parse("> [!TIP]\n> body");
     assert_eq!(
         doc.blocks,
-        vec![Block::new(BlockKind::Quote {
-            kind: Some(QuoteKind::Tip),
-            text: Text::plain("body"),
-        })]
+        vec![
+            Block::new(BlockKind::Paragraph(Text::plain("body"))).quoted(Quoted {
+                alert: Some(QuoteKind::Tip),
+            })
+        ]
     );
     assert_eq!(serialize(&doc), "> [!TIP]\n> body");
 }
@@ -343,10 +301,10 @@ fn a_marker_that_names_no_alert_stays_text() {
     let doc = parse("> [!BOGUS]\n> body");
     assert_eq!(
         doc.blocks,
-        vec![Block::new(BlockKind::Quote {
-            kind: None,
-            text: Text::plain("[!BOGUS]\nbody"),
-        })]
+        vec![
+            Block::new(BlockKind::Paragraph(Text::plain("[!BOGUS]\nbody")))
+                .quoted(Quoted::default())
+        ]
     );
 }
 
@@ -359,20 +317,96 @@ fn normalize_keeps_an_alert_with_no_body() {
     assert_eq!(serialize(&doc), "> [!TIP]");
 
     let mut plain = Doc {
-        blocks: vec![Block::new(BlockKind::Quote {
-            kind: None,
-            text: Text::default(),
-        })],
+        blocks: vec![Block::new(BlockKind::Paragraph(Text::default())).quoted(Quoted::default())],
     };
     plain.normalize();
     assert!(plain.blocks.is_empty());
 }
 
 #[test]
-fn a_quotes_paragraphs_each_carry_the_alert() {
-    // The flat model splits a blockquote's paragraphs into one block each, so
-    // the kind rides on both and the rewrite is two alerts.
-    let text = serialize(&parse("> [!TIP]\n> one\n>\n> two"));
-    assert_eq!(text, "> [!TIP]\n> one\n\n> [!TIP]\n> two");
-    assert_eq!(parse(&text), parse(&serialize(&parse(&text))));
+fn a_quotes_paragraphs_are_one_alert() {
+    let source = "> [!TIP]\n> one\n>\n> two";
+    let doc = parse(source);
+    let tip = Some(Quoted {
+        alert: Some(QuoteKind::Tip),
+    });
+    assert!(doc.blocks.iter().all(|block| block.quote == tip));
+    assert_eq!(serialize(&doc), source);
+}
+
+#[test]
+fn a_list_inside_a_quote_stays_a_list_and_stays_quoted() {
+    let source = "> - one\n> - two\n>     - nested";
+    let doc = parse(source);
+    let quoted = Some(Quoted::default());
+    assert_eq!(
+        doc.blocks,
+        vec![
+            Block::at(BlockKind::Bullet(Text::plain("one")), 0),
+            Block::at(BlockKind::Bullet(Text::plain("two")), 0),
+            Block::at(BlockKind::Bullet(Text::plain("nested")), 1),
+        ]
+        .into_iter()
+        .map(|block| Block {
+            quote: quoted,
+            ..block
+        })
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(serialize(&doc), source);
+}
+
+#[test]
+fn every_block_kind_can_be_quoted() {
+    for source in [
+        "> # Title",
+        "> 1. one\n> 2. two",
+        "> - [ ] task",
+        "> ```rs\n> let x = 1;\n> ```",
+        "> | a | b |\n> | --- | --- |\n> | 1 | 2 |",
+        "> ---",
+        "> [!NOTE]\n> - item\n>\n> text",
+    ] {
+        let doc = parse(source);
+        assert!(
+            doc.blocks.iter().all(|block| block.quote.is_some()),
+            "{source:?}: {:?}",
+            doc.blocks
+        );
+        assert_eq!(serialize(&doc), source);
+    }
+}
+
+#[test]
+fn a_quote_inside_a_list_item_stays_under_its_marker() {
+    let doc = parse("- item\n\n    > quoted");
+    assert_eq!(doc.blocks[0].quote, None);
+    assert_eq!(doc.blocks[1].indent, 1);
+    assert_eq!(doc.blocks[1].quote, Some(Quoted::default()));
+    assert_eq!(serialize(&doc), "- item\n\n    > quoted");
+
+    // The marker stays outside a quote that opens its item.
+    let doc = parse("- > quoted");
+    assert_eq!(
+        doc.blocks[0],
+        Block::new(BlockKind::Bullet(Text::default()))
+    );
+    assert_eq!(doc.blocks[1].quote, Some(Quoted::default()));
+}
+
+#[test]
+fn quotes_round_trip_to_a_fixed_point() {
+    for source in [
+        "> a\n\nb",
+        "> a\n\n> [!NOTE]\n> b",
+        "- x\n\n    > - a\n    >     - b\n\n    c",
+        "> - a\n\n- b",
+        "> > deep\n> outer",
+        "- > a\n- b",
+        "> [!WARNING]\n> - [x] done\n>\n> 1. one",
+    ] {
+        let once = parse(source);
+        let twice = parse(&serialize(&once));
+        assert_eq!(once, twice, "{source:?} drifted: {:?}", serialize(&once));
+    }
 }

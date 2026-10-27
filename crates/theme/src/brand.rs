@@ -43,8 +43,9 @@ pub const BASE_COLORS: [(&str, Tint); 5] = [
     ("Slate", Tint::new(257.417, 0.046)),
 ];
 
-/// The alpha of each text role over the appearance's ink — white in dark,
-/// black in light.
+/// The alpha of each text role over the palette's ink — the colour of
+/// [`Theme::text`] at full opacity. The shipped palettes' ink is white in dark
+/// and black in light.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextInk {
     /// [`Theme::text`].
@@ -65,12 +66,12 @@ impl TextInk {
     }
 
     /// Writes [`Theme::text`], [`Theme::text_muted`] and [`Theme::text_faint`]
-    /// for the theme's appearance.
+    /// at these alphas over the colour `theme.text` already carries.
     pub fn paint(&self, theme: &mut Theme) {
-        let appearance = theme.appearance;
-        theme.text = Self::color(appearance, self.text);
-        theme.text_muted = Self::color(appearance, self.muted);
-        theme.text_faint = Self::color(appearance, self.faint);
+        let ink = theme.text;
+        theme.text = ink.alpha(self.text);
+        theme.text_muted = ink.alpha(self.muted);
+        theme.text_faint = ink.alpha(self.faint);
     }
 }
 
@@ -148,13 +149,13 @@ impl Vibrancy {
     /// Whether to composite translucent for `appearance`.
     ///
     /// The platform gate rides on [`Vibrancy::Auto`] rather than on the caller:
-    /// it asks for a frost only where the compositor paints one behind the
-    /// window ([`frosted_window`](crate::frosted_window)), since a window that is merely transparent
+    /// it asks for a material only where the compositor blends one behind the
+    /// window ([`behind_window_blending`](crate::behind_window_blending)), since a window that is merely transparent
     /// shows raw desktop through the sidebar. An app that knows its compositor
     /// says [`Vibrancy::On`] and gets it anywhere.
     pub fn on(self, appearance: Appearance) -> bool {
         match self {
-            Self::Auto => crate::frosted_window() && matches!(appearance, Appearance::Dark),
+            Self::Auto => crate::behind_window_blending() && matches!(appearance, Appearance::Dark),
             Self::On => true,
             Self::Off => false,
         }
@@ -165,13 +166,17 @@ impl Vibrancy {
 ///
 /// Installed as a gpui [`Global`]; [`Theme::install`] applies it to whatever
 /// palette is registered, so it survives a light/dark switch and composes with
-/// [`set_palette`](crate::set_palette) rather than competing with it.
+/// [`crate::AppExt::set_palette`](crate::AppExt::set_palette) rather than competing with it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Brand {
-    /// The hue every grey in the palette carries.
+    /// The hue every grey in the palette carries. Opaque grey tokens take it;
+    /// a token that carries a hue of its own keeps it, and translucent ink is
+    /// left as it is.
     pub tint: Tint,
     /// The emphasis hue. Left neutral, the accent follows [`Self::tint`] like
-    /// any other grey — which is what the shipped palette already is.
+    /// any other grey — which is what the shipped palette already is. Set, it
+    /// moves [`Theme::accent`] and [`Theme::accent_strong`], and
+    /// [`Theme::on_accent`] becomes whichever label holds on that plate.
     pub accent: Tint,
     /// The base corner radius; every other corner is a ratio of it. See
     /// [`Theme::BASE_RADIUS`].
@@ -179,6 +184,11 @@ pub struct Brand {
     /// How opaque the tint over the blurred window is. See
     /// [`Theme::VIBRANCY_ALPHA`], where it starts, and [`Theme::vibrancy_tint`].
     pub vibrancy_alpha: f32,
+    /// How much of the chrome a floating content card covers. See
+    /// [`Theme::CONTENT_OPACITY`], where it starts, and [`Theme::content_bg`].
+    pub content_opacity: f32,
+    /// The blur behind the translucent window. See [`Theme::window_blur`].
+    pub window_blur: f32,
     /// Whether the window composites translucent, which is a question about
     /// the appearance as much as about the app — see [`Vibrancy`].
     pub vibrancy: Vibrancy,
@@ -202,6 +212,8 @@ impl Default for Brand {
             accent: Tint::NONE,
             radius: Theme::BASE_RADIUS,
             vibrancy_alpha: Theme::VIBRANCY_ALPHA,
+            content_opacity: Theme::CONTENT_OPACITY,
+            window_blur: Theme::WINDOW_BLUR,
             vibrancy: Vibrancy::Auto,
             glass: crate::LENSED,
             ink: Ink::APPKIT,
@@ -244,6 +256,8 @@ impl Brand {
         // wants the coverage it tuned, not a value that was overwritten while
         // nothing was looking at it.
         theme.vibrancy_alpha = self.vibrancy_alpha;
+        theme.content_opacity = self.content_opacity;
+        theme.window_blur = self.window_blur;
         theme.glass = self.glass;
         self.ink.for_appearance(theme.appearance).paint(theme);
         // Every colour token, with the rule doing the choosing: a token that is
@@ -251,76 +265,13 @@ impl Brand {
         // danger, warning, success — is semantic and keeps it. Translucent ink
         // is skipped because it paints over whatever is beneath it, which is
         // tinted already.
-        let tokens: [&mut Hsla; 39] = [
-            &mut theme.bg,
-            &mut theme.surface,
-            &mut theme.surface_raised,
-            &mut theme.surface_card,
-            &mut theme.surface_dialog,
-            &mut theme.surface_overlay,
-            &mut theme.element_hover,
-            &mut theme.element_active,
-            &mut theme.border,
-            &mut theme.border_strong,
-            &mut theme.text,
-            &mut theme.text_muted,
-            &mut theme.text_faint,
-            &mut theme.text_dim,
-            &mut theme.solid,
-            &mut theme.on_solid,
-            &mut theme.accent,
-            &mut theme.accent_strong,
-            &mut theme.on_accent,
-            &mut theme.danger,
-            &mut theme.danger_muted,
-            &mut theme.warning,
-            &mut theme.warning_muted,
-            &mut theme.success,
-            &mut theme.busy,
-            &mut theme.success_muted,
-            &mut theme.surface_raised_hover,
-            &mut theme.band,
-            &mut theme.input_bg,
-            &mut theme.selection,
-            &mut theme.cursor,
-            &mut theme.caret,
-            &mut theme.ring,
-            &mut theme.danger_strong,
-            &mut theme.code_text,
-            &mut theme.code_wash,
-            &mut theme.diff_add,
-            &mut theme.diff_del,
-            &mut theme.diff_hunk_bg,
-        ];
-        let syntax: [&mut Hsla; 24] = [
-            &mut theme.syntax.comment,
-            &mut theme.syntax.keyword,
-            &mut theme.syntax.string,
-            &mut theme.syntax.string_special,
-            &mut theme.syntax.escape,
-            &mut theme.syntax.number,
-            &mut theme.syntax.boolean,
-            &mut theme.syntax.type_name,
-            &mut theme.syntax.type_builtin,
-            &mut theme.syntax.constructor,
-            &mut theme.syntax.function,
-            &mut theme.syntax.function_builtin,
-            &mut theme.syntax.macro_name,
-            &mut theme.syntax.property,
-            &mut theme.syntax.constant,
-            &mut theme.syntax.variable,
-            &mut theme.syntax.variable_special,
-            &mut theme.syntax.parameter,
-            &mut theme.syntax.operator,
-            &mut theme.syntax.punctuation,
-            &mut theme.syntax.tag,
-            &mut theme.syntax.attribute,
-            &mut theme.syntax.label,
-            &mut theme.syntax.invalid,
-        ];
-        for slot in tokens.into_iter().chain(syntax) {
+        let tint = match theme.family {
+            None => self.tint,
+            Some(_) => Tint::NONE,
+        };
+        for (_, slot) in theme.tokens_mut() {
             if slot.a == 1.0 && slot.s <= f32::EPSILON {
-                *slot = color::tint(*slot, self.tint.hue, self.tint.chroma);
+                *slot = color::tint(*slot, tint.hue, tint.chroma);
             }
         }
 
@@ -344,16 +295,11 @@ impl Brand {
 
 /// Whichever of the palette's two extremes the plate can actually hold.
 fn label_on(plate: Hsla, theme: &Theme) -> Hsla {
-    let (a, b) = (theme.solid, theme.on_solid);
-    if color::contrast_ratio(plate, a) >= color::contrast_ratio(plate, b) {
-        a
-    } else {
-        b
-    }
+    color::legible_on(plate, theme.solid, theme.on_solid)
 }
 
 /// Read the installed brand (the default before one is set).
-pub fn brand(cx: &App) -> Brand {
+pub(crate) fn brand(cx: &App) -> Brand {
     cx.try_global::<Brand>().copied().unwrap_or_default()
 }
 
@@ -362,7 +308,7 @@ pub fn brand(cx: &App) -> Brand {
 /// Colours are read imperatively at paint time, so nothing observes the theme
 /// global — the same reason [`appearance::apply`](crate::appearance::apply)
 /// refreshes rather than notifies.
-pub fn set_brand(brand: Brand, cx: &mut App) {
+pub(crate) fn set_brand(brand: Brand, cx: &mut App) {
     cx.set_global(brand);
     Theme::install(crate::paint::current_appearance(), cx);
     // Crossing 1.0 is what puts the `NSVisualEffectView` in or takes it out,

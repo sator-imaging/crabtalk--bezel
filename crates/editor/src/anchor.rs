@@ -25,12 +25,29 @@ use markdown::{Annotation, Cursor, Part, Selection, Splice};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnchorId(pub u64);
 
+/// Each anchor's range in byte offsets into the markdown, `None` where the
+/// markdown has no place for an end.
+pub type SourceRanges = Vec<(AnchorId, Option<Range<usize>>)>;
+
 /// A range in the document, and which wash it paints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub id: AnchorId,
     pub range: Selection,
     pub state: Annotation,
+    /// Whether a press on it does something the app answers. The pointer is a
+    /// hand over an actionable anchor and an I-beam over any other text.
+    pub actionable: bool,
+}
+
+/// An anchor as [`crate::Document::set_source_anchors`] takes it: its range in
+/// byte offsets into the markdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceAnchor {
+    pub id: AnchorId,
+    pub range: Range<usize>,
+    pub state: Annotation,
+    pub actionable: bool,
 }
 
 impl Anchor {
@@ -39,6 +56,7 @@ impl Anchor {
             id,
             range,
             state: Annotation::default(),
+            actionable: false,
         }
     }
 
@@ -68,6 +86,11 @@ impl Anchor {
 /// an anchor mapped through the wrong shift points at the wrong words and
 /// nothing complains.
 pub(crate) enum Delta {
+    CellsMoved {
+        block: usize,
+        from: crate::editor::Line,
+        to: usize,
+    },
     /// Text went in, out, or both.
     Spliced(Splice),
     /// A run of blocks left `at`, and arrived at `to` unless it went away.
@@ -92,8 +115,29 @@ pub(crate) enum Delta {
 
 impl Delta {
     /// Where `at` ends up, and `None` when the block under it went away.
-    fn cursor(&self, at: Cursor) -> Option<Cursor> {
+    pub(crate) fn cursor(&self, at: Cursor) -> Option<Cursor> {
         match self {
+            Self::CellsMoved { block, from, to } => {
+                let mut at = at;
+                if at.block == *block
+                    && let Part::Cell { row, column } = &mut at.part
+                {
+                    let (index, from) = match from {
+                        crate::editor::Line::Row(from) => (row, *from),
+                        crate::editor::Line::Column(from) => (column, *from),
+                    };
+                    *index = if *index == from {
+                        *to
+                    } else if from < *index && *index <= *to {
+                        *index - 1
+                    } else if *to <= *index && *index < from {
+                        *index + 1
+                    } else {
+                        *index
+                    };
+                }
+                Some(at)
+            }
             Self::Spliced(splice) => {
                 let (start, end) = splice.removed.ordered();
                 if at < start {

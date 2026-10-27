@@ -501,7 +501,7 @@ impl Gallery {
                                                         &theme,
                                                         &columns,
                                                         index == 0,
-                                                        false,
+                                                        theme::Selection::None,
                                                         vec![
                                                             SharedString::from(*name)
                                                                 .into_any_element(),
@@ -577,8 +577,11 @@ impl Gallery {
                                             tree::tree_row(
                                                 &theme,
                                                 &entry.row,
-                                                self.data.tree_selected.as_deref()
-                                                    == Some(&entry.path),
+                                                theme::Selection::new(
+                                                    self.data.tree_selected.as_deref()
+                                                        == Some(&entry.path),
+                                                    true,
+                                                ),
                                                 index == self.data.tree_cursor,
                                             )
                                             .id(SharedString::from(format!("tree-{index}")))
@@ -662,7 +665,7 @@ impl Gallery {
                             ))
                             .child(scroll::scrollbar(
                                 "virtual-bar",
-                                &list::scroll_handle(&self.data.rows_scroll),
+                                list::scroll_handle(&self.data.rows_scroll),
                                 &self.data.rows_bar,
                             )),
                     )

@@ -19,6 +19,12 @@ name = "browser"
 [lints]
 workspace = true
 
+[features]
+default = []
+# `WebView::with_inspector` and `open_inspector`. On macOS this compiles in
+# wry's calls to private WebKit API (`developerExtrasEnabled`, `_inspector`).
+inspector = ["wry/devtools"]
+
 [dependencies]
 gpui.workspace = true
 ui.workspace = true
@@ -32,7 +38,7 @@ wry = { version = "0.57", default-features = false }
 raw-window-handle = "0.6"
 objc2 = "0.6"
 block2 = "0.6"
-image = { version = "0.25", default-features = false }
+image.workspace = true
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "block2",
@@ -87,7 +93,7 @@ windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 raw-window-handle = "0.6"
-wasm-bindgen = "0.2"
+wasm-bindgen.workspace = true
 web-sys = { version = "0.3", features = [
     "CssStyleDeclaration",
     "Document",

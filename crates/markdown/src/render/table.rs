@@ -52,8 +52,8 @@ pub(super) fn table(
                 cell,
                 weight,
                 theme,
-                |name| crate::marks::paint_of(cx, name, theme),
-                |url| preview::of(cx, url),
+                |name| crate::paint::marks::paint_of(cx, name, theme),
+                |url| crate::app::link::preview(crate::Link::new(url, overlay.base), cx),
             );
             if !flat.text.is_empty() {
                 let width = f32::from(
@@ -81,7 +81,7 @@ pub(super) fn table(
         .iter()
         .map(|natural| natural.min(TABLE_MIN_COLUMN_WIDTH))
         .collect();
-    let hairline = theme.hairline(0.10);
+    let hairline = theme.border;
 
     let mut inner = div()
         .flex()
@@ -120,6 +120,8 @@ pub(super) fn table(
                         |_, _, _, _| (),
                     )
                     .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
                     .size_full()
                 }));
                 cell_el = cell_el.child(painted_text(
@@ -136,13 +138,21 @@ pub(super) fn table(
         inner = inner.child(row_el);
     }
 
-    ui::scroll::Viewport::new(
+    let table = ui::scroll::Viewport::new(
         format!("md-table-scroll-{ix}"),
         div()
             .id(ElementId::named_usize("md-table", ix))
             .w_full()
             .child(inner),
         gpui::Axis::Horizontal,
-    )
-    .into_any_element()
+    );
+    if overlay.table_controls {
+        div()
+            .w_full()
+            .p(px(TABLE_CONTROL_SIZE))
+            .child(table)
+            .into_any_element()
+    } else {
+        table.into_any_element()
+    }
 }

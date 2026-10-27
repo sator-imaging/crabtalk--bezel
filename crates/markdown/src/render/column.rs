@@ -10,7 +10,7 @@ use gpui::{
 const REVEAL_TRIES: u8 = 4;
 
 /// The column item holding a cursor.
-pub(super) type ItemOf = Box<dyn Fn(Cursor) -> usize>;
+pub(super) type ItemOf = Rc<dyn Fn(Cursor) -> usize>;
 
 /// Builds one block's box, without the gap above it.
 pub(super) type BuildBlock = Box<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
@@ -157,6 +157,8 @@ impl Element for Column {
         let count = self.keys.len();
         if count == 0 {
             self.layouts.set_revealing(None);
+            self.layouts
+                .place(bounds.origin, Vec::new(), self.item_of.clone());
             return Vec::new();
         }
         let revealed = reveal.map(|reveal| (self.item_of)(reveal.range.ordered().0).min(count - 1));
@@ -248,6 +250,16 @@ impl Element for Column {
                 .record_height(item.ix, self.keys[item.ix], *measured);
         }
 
+        let placed_tops = (0..count)
+            .map(|ix| placed[ix].unwrap_or(tops[ix]))
+            .collect();
+        if self
+            .layouts
+            .place(bounds.origin, placed_tops, self.item_of.clone())
+        {
+            changed = true;
+        }
+
         if shift != px(0.0)
             && let Some(scroll) = &self.scroll
         {
@@ -260,19 +272,35 @@ impl Element for Column {
                 Some((start, end)) => (top + start, top + end),
                 None => (top, top + revealed_height.unwrap_or_default()),
             };
-            let inside = from <= start && end <= to;
+            // A nearest reveal that has moved the document settles at the
+            // margin, not at the edge.
+            let pad = match (reveal.mode, reveal.scrolled) {
+                (RevealMode::Nearest, true) => px(REVEAL_MARGIN),
+                _ => px(0.0),
+            };
+            let inside = from + pad <= start && end <= to - pad;
             // Only last frame's rows say where the range is inside its item.
             let shown = extent.is_some() && inside;
             match &self.scroll {
                 Some(scroll) if !shown && reveal.tries < REVEAL_TRIES => {
-                    let off = match inside {
-                        true => px(0.0),
-                        false => (start + end) * 0.5 - (from + to) * 0.5,
+                    let off = match (inside, reveal.mode) {
+                        (true, _) => px(0.0),
+                        (false, RevealMode::Center) => (start + end) * 0.5 - (from + to) * 0.5,
+                        (false, RevealMode::Nearest) => {
+                            let margin = px(REVEAL_MARGIN);
+                            let up = start - (from + margin);
+                            match up < px(0.0) {
+                                true => up,
+                                false => (end - (to - margin)).min(up),
+                            }
+                        }
                     };
                     let offset = scroll.offset();
                     scroll.set_offset(point(offset.x, offset.y - off));
                     self.layouts.set_revealing(Some(Reveal {
                         range: reveal.range,
+                        mode: reveal.mode,
+                        scrolled: reveal.scrolled || off != px(0.0),
                         tries: reveal.tries + 1,
                         top: Some(bounds.top() + top),
                     }));

@@ -34,7 +34,8 @@
 use std::cmp::Ordering;
 
 use gpui::{
-    BoxShadow, Div, ElementId, SharedString, Stateful, StyleRefinement, div, point, prelude::*, px,
+    AnyElement, BoxShadow, Div, ElementId, Hsla, SharedString, Stateful, StyleRefinement, div,
+    point, prelude::*, px,
 };
 
 use icons::Icon;
@@ -42,9 +43,12 @@ use theme::{TextStyle, Theme, Typeset};
 
 use crate::widgets::{self, Buttons as _};
 
+mod bar;
 mod reorder;
 
-pub use reorder::Reorder;
+pub use bar::TabBar;
+
+pub use reorder::{Bar, Move, OutsideDrop, Reorder};
 
 /// An ordered set of tabs, one of them active.
 ///
@@ -143,11 +147,11 @@ impl<Id: Clone + PartialEq> Strip<Id> {
         true
     }
 
-    /// Step the front `step` tabs along, wrapping at both ends. An empty strip
-    /// does not move.
-    pub fn cycle(&mut self, step: isize) {
+    /// Step the front `step` tabs along, wrapping at both ends. Whether the
+    /// front changed: an empty strip, a lone tab and a whole lap do not move.
+    pub fn cycle(&mut self, step: isize) -> bool {
         if self.order.is_empty() {
-            return;
+            return false;
         }
         let len = self.order.len() as isize;
         let at = self
@@ -155,10 +159,15 @@ impl<Id: Clone + PartialEq> Strip<Id> {
             .as_ref()
             .and_then(|id| self.index_of(id))
             .unwrap_or(0) as isize;
-        self.active = self
+        let next = self
             .order
             .get((at + step).rem_euclid(len) as usize)
             .cloned();
+        if next == self.active {
+            return false;
+        }
+        self.active = next;
+        true
     }
 
     /// Move the tab at `from` so that it sits at `to`. Out-of-range ends are
@@ -217,12 +226,18 @@ impl<Id: Clone + PartialEq> Strip<Id> {
 }
 
 /// What a tab shows.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct Label {
     text: SharedString,
-    icon: Option<Icon>,
+    lead: Option<Lead>,
     badge: Option<SharedString>,
     mark: Option<Icon>,
+}
+
+/// What stands before a tab's text.
+enum Lead {
+    Icon(Icon),
+    Drawn(AnyElement),
 }
 
 impl Label {
@@ -235,7 +250,15 @@ impl Label {
 
     /// A glyph before the text — what kind of thing the tab is on.
     pub fn with_icon(mut self, icon: impl Into<Icon>) -> Self {
-        self.icon = Some(icon.into());
+        self.lead = Some(Lead::Icon(icon.into()));
+        self
+    }
+
+    /// A drawn element before the text, in place of [`Self::with_icon`]'s
+    /// glyph: an animated mark, a status. Centred in the icon's box, and free
+    /// to paint past it.
+    pub fn with_lead(mut self, lead: impl IntoElement) -> Self {
+        self.lead = Some(Lead::Drawn(lead.into_any_element()));
         self
     }
 
@@ -265,9 +288,37 @@ impl Label {
 /// only one tab in the window has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
+    /// Behind another tab of its strip.
     Resting,
+    /// In front of its strip, in a pane without the keyboard.
     Front,
+    /// The tab holding the keyboard. One per window.
     Focused,
+}
+
+impl State {
+    /// The label's ink.
+    pub fn tint(self, theme: &Theme) -> Hsla {
+        match self {
+            Self::Resting => theme.text_muted,
+            Self::Front | Self::Focused => theme.text,
+        }
+    }
+}
+
+/// What a reorderable strip's tabs stand on — see [`Bar::on_track`]. A track
+/// and its tabs are capsules, a [`Track::Flat`]'s rounded as a control is; the
+/// tabs share its width equally down to
+/// [`TRACK_MIN_WIDTH`], their labels centred, and a line parts two resting
+/// neighbours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Track {
+    /// The segmented control's track, its border drawn.
+    Bordered,
+    /// The same wash with no border.
+    Bare,
+    /// No wash and no border.
+    Flat,
 }
 
 /// When a tab's `×` is on show.
@@ -317,6 +368,16 @@ pub fn drop_mark(style: StyleRefinement, side: Side, theme: &Theme) -> StyleRefi
 /// How wide one tab grows before its label truncates.
 pub const MAX_WIDTH: f32 = 180.0;
 
+/// The narrowest a tab on a [`Track`] gets before its strip scrolls.
+pub const TRACK_MIN_WIDTH: f32 = 120.0;
+
+/// How tall a [`Track`] stands. Its tabs fill it inside its border and
+/// [`TRACK_PAD`].
+pub const TRACK_HEIGHT: f32 = 30.0;
+
+/// The padding between a [`Track`]'s border and its tabs.
+const TRACK_PAD: f32 = 1.0;
+
 /// The box [`Label::mark`] paints in. Lucide's `circle-small` inks 14 of its 24
 /// units, which puts a solid one at 6px across.
 pub const MARK_SIZE: f32 = 10.0;
@@ -324,23 +385,21 @@ pub const MARK_SIZE: f32 = 10.0;
 /// Gap between tabs.
 const GAP: f32 = 2.0;
 /// Inset at a tab's ends, and the gap between what it holds.
-const TAB_PAD: f32 = 8.0;
+pub const TAB_PAD: f32 = 8.0;
+/// The box a tab's icon, or what stands in its place, is laid in.
+const ICON_SIZE: f32 = 14.0;
 
 /// The strip. Tabs go in it; a `+`, a `···` and anything else on the row are
 /// the caller's, outside this.
 ///
-/// It scrolls sideways once the tabs no longer fit. `min_w_0` is what allows
+/// It scrolls sideways once the tabs no longer fit, by wheel and trackpad; it
+/// draws no scrollbar. Without [`TabBar::track_scroll`] it keeps its offset
+/// across renders under `id`.
+/// `min_w_0` is what allows
 /// that — a flex child's `min-width: auto` refuses to shrink below its content,
 /// so without it the strip grows past its row instead of scrolling.
-pub fn bar(id: impl Into<ElementId>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .min_w_0()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(GAP))
-        .overflow_x_scroll()
+pub fn bar(id: impl Into<ElementId>) -> TabBar {
+    TabBar::new(id.into())
 }
 
 /// One tab, up to the `×`: pass the same `key` to [`close`] and chain the
@@ -360,42 +419,35 @@ pub fn tab(
 ) -> Stateful<Div> {
     let key = key.into();
     let group = group_of(&key);
-    let tint = match state {
-        State::Resting => theme.text_muted,
-        State::Front | State::Focused => theme.text,
-    };
+    let tint = state.tint(theme);
     let wash = theme.element_hover;
-    div()
+    chip(theme, state)
         .id(ElementId::from(SharedString::from(format!("tab-{key}"))))
         .group(group)
         // Sized to its label, not to the bar: a tab stretched across the strip
         // reads as a field rather than a label.
         .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(Theme::BUTTON_HEIGHT))
         .max_w(px(MAX_WIDTH))
-        .px(px(TAB_PAD))
-        .rounded(px(Theme::control_radius()))
-        // The slot `focus::focusable` fills, kept whether or not it is filled:
-        // gpui sizes border-box, so a border that arrived with the ring would
-        // shift the label by a pixel.
-        .border_1()
-        .border_color(widgets::RING_SLOT)
-        .text_style(TextStyle::Callout)
-        .text_color(tint)
         .cursor_pointer()
-        .when(state == State::Focused, |el| el.bg(theme.element_active))
         .when(state != State::Focused, |el| {
             el.hover(move |el| el.bg(wash))
         })
-        .children(label.icon.map(|icon| {
-            crate::icons::icon(icon)
-                .size(px(14.0))
-                .flex_none()
-                .text_color(theme.text_muted)
+        .children(label.lead.map(|lead| {
+            match lead {
+                Lead::Icon(icon) => crate::icons::icon(icon)
+                    .size(px(ICON_SIZE))
+                    .flex_none()
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+                Lead::Drawn(drawn) => div()
+                    .size(px(ICON_SIZE))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(drawn)
+                    .into_any_element(),
+            }
         }))
         .child(div().min_w_0().truncate().child(label.text))
         .children(label.mark.map(|mark| {
@@ -413,9 +465,35 @@ pub fn tab(
         }))
 }
 
+/// A tab's frame without its label: its height, inset, corners and ring
+/// slot, the label's ink for `state`, and the selected wash and ring while
+/// [`State::Focused`]. What [`tab`] is drawn on, for a label that is not a
+/// [`Label`].
+pub fn chip(theme: &Theme, state: State) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(Theme::BUTTON_HEIGHT))
+        .px(px(TAB_PAD))
+        .rounded(px(Theme::control_radius()))
+        // The slot `focus::focusable` fills, kept whether or not it is filled:
+        // gpui sizes border-box, so a border that arrived with the ring would
+        // shift the label by a pixel.
+        .border_1()
+        .border_color(widgets::RING_SLOT)
+        .text_style(TextStyle::Callout)
+        .text_color(state.tint(theme))
+        .when(state == State::Focused, |el| {
+            el.bg(theme.card_selected_bg())
+                .shadow(theme::glass_selected_shadows())
+        })
+}
+
 /// A tab's `×`, for the `key` its [`tab`] was built with. The click is the
-/// caller's, and has to stop propagating or the tab under it takes the press
-/// as well.
+/// caller's. It stops mouse-down propagation, so a press on it neither clicks
+/// nor picks up the tab under it.
 pub fn close(theme: &Theme, key: impl Into<SharedString>, when: Close) -> Stateful<Div> {
     let key = key.into();
     let button = theme
@@ -423,6 +501,7 @@ pub fn close(theme: &Theme, key: impl Into<SharedString>, when: Close) -> Statef
             "tab-close-{key}"
         ))))
         .flex_none()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .p(px(2.0))
         .child(
             crate::icons::icon(crate::icons::glyph::X)
