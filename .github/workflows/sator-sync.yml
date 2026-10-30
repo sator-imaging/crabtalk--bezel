@@ -24,7 +24,7 @@ jobs:
       - run: git remote add upstream ${{ env.UPSTREAM }}
       - run: git fetch upstream
       - run: git restore --source=upstream/main .
-      - run: git restore .github/workflows/sator*
+      - run: git restore .github/workflows
 
       - name: Update GPUI dependencies
         run: |
@@ -35,18 +35,7 @@ jobs:
           VERSION=$(jq -r '.[0].version' changelog.json)
           echo "UPSTREAM_VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Check for changes
-        id: diff
-        run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No changes from upstream; skipping PR creation."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
-        if: steps.diff.outputs.changed == 'true'
         with:
           commit-message: "[bot] hard sync with upstream `${{ env.UPSTREAM_VERSION }}`"
           title:          "[bot] hard sync with upstream `${{ env.UPSTREAM_VERSION }}`"
