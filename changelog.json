@@ -1,5 +1,44 @@
 [
   {
+    "version": "0.2.22",
+    "date": "2026-10-28",
+    "summary": "A busy mascot, browser stills on Windows, and modals that stay open under their own menus; on bezel-gpui 0.3.21.",
+    "new": [
+      "`Motion::BUSY` sweeps the gaze side to side. `Motion::scan` is how far, `Motion::sweep(t)` the offset at `t`, and `Motion::reach()` the drift and the sweep together. A `mascot` draws the sweep.",
+      "On Windows, a covered browser page shows a still of itself, taken with WebView2's `CapturePreview`."
+    ],
+    "changed": [
+      "Breaking: `Motion` has a `scan` field.",
+      "On bezel-gpui 0.3.21: on Windows, a window's child windows, such as a WebView2 page, draw over gpui's content."
+    ],
+    "fixed": [
+      "A modal closes on a press that lands on its scrim, so picking from a menu that reaches past its card leaves it open.",
+      "On Windows, moving keyboard focus into or out of a browser page runs between gpui updates."
+    ]
+  },
+  {
+    "version": "0.2.21",
+    "date": "2026-10-26",
+    "summary": "Markdown rendered as HTML, with highlighted code and a stylesheet from the theme, timed against tiptap; and a mascot that can sleep.",
+    "new": [
+      "`markdown::html(&doc)` writes a document as semantic HTML, without gpui. `Html::new().url(…)` decides what every URL becomes, and `.fence(…)` writes a fenced block's markup from its language and code, such as a mermaid diagram's SVG. Elements of the crate's own carry `md-` classes, and headings carry their GitHub anchors. URLs are percent-encoded, and a `javascript:`, `vbscript:`, `file:` or non-image `data:` URL is written empty.",
+      "With `gpui`, `Html::highlighter(…)` wraps a fence's highlighted spans in `hl-` classes, and `Html::stylesheet(light, dark, typography)` is the CSS the markup is set with: the theme's colors as custom properties, dark under `prefers-color-scheme`, and the document's type sizes.",
+      "`Doc::anchors` is each heading's anchor and its block. `HighlightKind::name` is a kind as a stable word, and `HighlightKind::ALL` every kind.",
+      "`markdown::html` is checked against the CommonMark 0.31.2 and GFM spec examples that `crates/markdown/tests/spec/fetch.sh` downloads: 450 of 652 CommonMark examples pass, and the rest are listed in `tests/spec/failing`.",
+      "`npm --prefix crates/markdown/tests/tiptap run bench` times parsing, HTML and serializing against tiptap 3.32, on the workspace READMEs and the CommonMark spec.",
+      "`Motion::lid` is how shut the mascot's eyes rest, and `Motion::ASLEEP` has them shut."
+    ],
+    "changed": [
+      "Breaking: `markdown::app::link::slug` is `markdown::doc::slug`.",
+      "Breaking: `Motion` has a `lid` field.",
+      "The benchmark comparison script is `bench/compare.mjs`, shared by the mermaid and markdown benchmarks, and its rows count `inputs`.",
+      "The release profile builds at `opt-level = 3` rather than `\"z\"`, and benches run on it."
+    ],
+    "fixed": [
+      "Heading anchors in a document that repeats a title many times are found in linear time."
+    ]
+  },
+  {
     "version": "0.2.20",
     "date": "2026-10-23",
     "summary": "A resting content card, tab chips and drawn tab leads, emphasized and unemphasized selection, and link cards that stay open under the pointer.",
