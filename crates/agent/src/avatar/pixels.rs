@@ -12,7 +12,7 @@ use theme::Theme;
 pub const GRID: usize = 8;
 
 /// The lid closes the eye to a sliver rather than to nothing, so a blink keeps
-/// its shape on the way down.
+/// its shape on the way down. Shut all the way, the eye leaves no hole.
 const SQUEEZE: f32 = 0.92;
 
 /// One row per byte, bit `x` set where the body covers cell `x`.
@@ -49,6 +49,9 @@ fn unit(i: usize, span: f32) -> f32 {
 }
 
 fn punch(rows: &mut [u8; GRID], eye: &Eye, lid: f32, span: f32) {
+    if lid >= 1.0 {
+        return;
+    }
     let ry = (eye.ry * (1.0 - lid * SQUEEZE)).max(f32::EPSILON);
     let (sin, cos) = eye.rot.to_radians().sin_cos();
     let mut hit = false;
@@ -87,13 +90,17 @@ fn cell(u: f32, span: f32) -> usize {
 /// [`Pose`](crate::avatar::Pose).
 pub fn mascot(face: &Face, t: f32) -> AnyElement {
     // Drift and breath are both under a cell at this size, so only the blink
-    // survives the trip; the outline is the resting one, since a wobble that
-    // cannot move a whole cell only flickers the ones on the edge.
-    let rows = cells(
-        &face.shape,
-        &face.eyes.place(&face.shape, 0.0),
-        face.motion.beat(t).lid,
-    );
+    // and the sweep survive the trip; the outline is the resting one, since a
+    // wobble that cannot move a whole cell only flickers the ones on the edge.
+    let sweep = face.motion.sweep(t);
+    let eyes = face
+        .eyes
+        .place(&face.shape, face.motion.scan)
+        .map(|eye| Eye {
+            cx: eye.cx + sweep,
+            ..eye
+        });
+    let rows = cells(&face.shape, &eyes, face.motion.beat(t).lid);
     let tint = face.color;
     canvas(
         move |_: Bounds<Pixels>, _, _| (),
