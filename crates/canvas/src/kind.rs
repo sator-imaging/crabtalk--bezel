@@ -16,29 +16,32 @@
 //! replaceable, and a type nothing names is [`unknown`]. [`chrome`] dresses a
 //! box the way they do.
 
-use markdown::AppExt as _;
+use crate::{
+    handle::{self, Handle},
+    mindmap::{NODE_HEIGHT, NODE_WIDTH},
+    model::{self, Node, Shape},
+    presentation::Measure,
+};
+use gpui::{
+    AnyElement, App, Div, Global, Hsla, ObjectFit, Pixels, Size, Styled, StyledImage, Window, div,
+    img, prelude::*, px,
+};
+use markdown::{AppExt as _, Doc, Editing, Typography};
 use std::{
     cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
 };
-
-use gpui::{
-    AnyElement, App, Div, Global, Hsla, ObjectFit, Styled, StyledImage, Window, div, img,
-    prelude::*, px,
-};
-use markdown::{Doc, Editing};
 use theme::{TextStyle, Theme, Typeset};
-
-use crate::{
-    handle::{self, Handle},
-    mindmap::{NODE_HEIGHT, NODE_WIDTH},
-    model::{self, Node, Shape},
+use ui::{
+    icons::{self, Icon},
+    scroll,
+    tiled_image::TiledImage,
 };
 
 /// Inside a dressed box, in canvas units.
-pub const PAD: f32 = 12.0;
+pub const PAD: f32 = 16.0;
 /// A dressed box's corners, in canvas units.
 pub const RADIUS: f32 = 8.0;
 /// A coloured frame's wash of its colour.
@@ -70,25 +73,126 @@ pub enum Chrome {
 }
 
 /// What a node paints with.
-pub struct Look {
-    /// The view's scale. gpui does not transform an element, so the kind
-    /// applies it to what it paints — `Typography::scaled`, `text_style_at`.
+#[derive(Clone)]
+pub struct Card {
     pub zoom: f32,
-    /// The editor typing into the node while it is edited, for the kind to
-    /// place where the field it edits shows.
+    pub size: Size<Pixels>,
+    pub typography: Typography,
+    pub selected: bool,
+    pub sizing: Sizing,
+    pub measure: Measure,
+}
+
+pub enum Content {
+    Flow(AnyElement),
+    Fill(AnyElement),
+}
+
+pub struct Look {
+    pub card: Card,
     pub editor: Option<AnyElement>,
 }
+
+impl Card {
+    pub fn render(
+        &self,
+        node: &Node,
+        header: Option<(String, Icon)>,
+        content: Content,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let typography = self.typography;
+        let metadata = typography.body.size() * 13. / 16.;
+        let header_height = if header.is_some() {
+            metadata * 18. / 13. + 8. * self.zoom
+        } else {
+            0.
+        };
+        let padding = if self.sizing == Sizing::Fixed {
+            ((self.size.height.as_f32() - 2. - header_height - typography.body.line_height()) / 2.)
+                .clamp(0., PAD * self.zoom)
+        } else {
+            PAD * self.zoom
+        };
+        let content = match content {
+            Content::Flow(content) => {
+                let content = self
+                    .measure
+                    .wrap(content, (padding * 2. + 2. + header_height) / self.zoom);
+                if self.sizing == Sizing::Fixed {
+                    scroll::claiming_pane(
+                        format!("canvas-content-{}", node.id),
+                        scroll::Axes::Vertical,
+                        window,
+                        cx,
+                    )
+                    .flex_1()
+                    .min_h_0()
+                    .when(!self.selected, |pane| pane.overflow_hidden())
+                    .child(content)
+                    .into_any_element()
+                } else {
+                    content
+                }
+            }
+            Content::Fill(content) => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(content)
+                .into_any_element(),
+        };
+        chrome(Chrome::Card, node, self.zoom, cx)
+            .min_h_0()
+            .py(px(padding))
+            .when(header.is_some(), |el| el.gap(px(8. * self.zoom)))
+            .children(header.map(|(title, mark)| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6. * self.zoom))
+                    .text_size(px(metadata))
+                    .line_height(px(metadata * 18. / 13.))
+                    .text_color(Theme::of(cx).text_muted)
+                    .child(icons::icon(mark).flex_none().size(px(14. * self.zoom)))
+                    .child(div().min_w_0().text_ellipsis().child(title))
+            }))
+            .child(content)
+            .into_any_element()
+    }
+}
+
+pub type Controls = Rc<dyn Fn(&Node, &Card, &mut Window, &mut App) -> Option<AnyElement>>;
 
 /// A node's content. See [`text_style`] and [`chrome`].
 pub type Paint = Rc<dyn Fn(&Node, Look, &mut Window, &mut App) -> AnyElement>;
 pub type Read = Rc<dyn Fn(&Node) -> String>;
 pub type Write = Rc<dyn Fn(&mut Node, String)>;
-pub type Open = Rc<dyn Fn(&Node, &mut App)>;
+pub type OpenHandler = Rc<dyn Fn(&Node, &mut App)>;
+
+#[derive(Clone)]
+pub enum Open {
+    Direct(OpenHandler),
+    Host,
+}
 pub type Child = Rc<dyn Fn(&Node) -> Node>;
 
-/// The string field editing a node in place changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Control {
+    Text,
+    #[default]
+    Document,
+    Name,
+    Url,
+    External,
+}
+
+/// The field and control used to edit a node.
 #[derive(Clone)]
 pub struct Field {
+    pub control: fn(&Node) -> Control,
     pub read: Read,
     pub write: Write,
 }
@@ -99,9 +203,14 @@ impl Field {
         write: impl Fn(&mut Node, String) + 'static,
     ) -> Self {
         Self {
+            control: |_| Control::Document,
             read: Rc::new(read),
             write: Rc::new(write),
         }
+    }
+    pub fn with_control(mut self, control: fn(&Node) -> Control) -> Self {
+        self.control = control;
+        self
     }
 }
 
@@ -211,8 +320,13 @@ pub struct Rules {
 
 #[derive(Clone)]
 pub struct Kind {
+    pub exportable: bool,
+    pub retained: bool,
     pub rules: Rules,
+    /// Pointer interactions belong in `controls`; the drag surface covers this content.
     pub render: Paint,
+    /// Interactive content above the drag hitbox and below selection handles.
+    pub controls: Option<Controls>,
     /// What a double-click does in place of editing.
     pub open: Option<Open>,
 }
@@ -224,6 +338,8 @@ impl Kind {
         render: impl Fn(&Node, Look, &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         Self {
+            exportable: false,
+            retained: false,
             rules: Rules {
                 can: Capabilities::ALL,
                 sizing: Sizing::Fixed,
@@ -233,8 +349,22 @@ impl Kind {
                 handles: handle::sides_and_corner,
             },
             render: Rc::new(render),
+            controls: None,
             open: None,
         }
+    }
+
+    /// The renderer ignores node position and observes external state through
+    /// child views. Fixed-size bodies can be cached independently of overlays.
+    pub fn retained(mut self) -> Self {
+        self.retained = true;
+        self
+    }
+
+    /// Marks a renderer that paints entirely through GPUI.
+    pub fn exportable(mut self) -> Self {
+        self.exportable = true;
+        self
     }
 
     /// Hold what sits inside its box, as a group does.
@@ -267,8 +397,21 @@ impl Kind {
         self
     }
 
+    pub fn controls(
+        mut self,
+        controls: impl Fn(&Node, &Card, &mut Window, &mut App) -> Option<AnyElement> + 'static,
+    ) -> Self {
+        self.controls = Some(Rc::new(controls));
+        self
+    }
+
     pub fn open(mut self, open: impl Fn(&Node, &mut App) + 'static) -> Self {
-        self.open = Some(Rc::new(open));
+        self.open = Some(Open::Direct(Rc::new(open)));
+        self
+    }
+
+    pub fn open_in_host(mut self) -> Self {
+        self.open = Some(Open::Host);
         self
     }
 
@@ -334,6 +477,14 @@ impl Kinds {
         self.kinds.get(name).unwrap_or(&self.unknown)
     }
 
+    pub fn sizing(&self, node: &Node) -> Sizing {
+        if node.is_label() {
+            Sizing::Grows
+        } else {
+            self.get(&node.kind).rules.sizing
+        }
+    }
+
     /// Whether a node's kind holds what sits inside it.
     pub fn holds(&self, node: &Node) -> bool {
         self.get(&node.kind).rules.holds
@@ -380,19 +531,39 @@ pub(crate) fn installed(cx: &App) -> Kinds {
 pub fn text() -> Kind {
     let parsed = Parsed::default();
     Kind::new(move |node, look, window, cx| {
+        if node.is_label() {
+            let content = match look.editor {
+                Some(editor) => editor,
+                None => render_text(&parsed, node, look.card.typography, window, cx),
+            };
+            return div()
+                .w_full()
+                .child(look.card.measure.wrap(content, 0.))
+                .into_any_element();
+        }
         let content = match look.editor {
             Some(editor) => editor,
-            None => render_text(&parsed, node, look.zoom, window, cx),
+            None => render_text(&parsed, node, look.card.typography, window, cx),
         };
-        chrome(Chrome::Card, node, look.zoom, cx)
-            .child(content)
-            .into_any_element()
+        look.card
+            .render(node, None, Content::Flow(content), window, cx)
     })
+    .retained()
+    .exportable()
     .sizing(Sizing::Grows)
-    .edit(Field::new(
-        |node| node.text.clone().unwrap_or_default(),
-        |node, text| node.text = Some(text),
-    ))
+    .edit(
+        Field::new(
+            |node| node.text.clone().unwrap_or_default(),
+            |node, text| node.text = Some(text),
+        )
+        .with_control(|node| {
+            if node.is_label() {
+                Control::Text
+            } else {
+                Control::Document
+            }
+        }),
+    )
 }
 
 /// Its path in a card. [`Kinds::with_root`] previews images.
@@ -402,20 +573,29 @@ pub fn file() -> Kind {
 
 /// Its URL in a card, which a double-click opens and `f2` edits.
 pub fn link() -> Kind {
-    Kind::new(|node, look, _, cx| {
+    Kind::new(|node, look, window, cx| {
         let url = label(
             node.url.clone().unwrap_or_default(),
-            look.zoom,
+            look.card.zoom,
             Theme::of(cx).accent,
         );
-        chrome(Chrome::Card, node, look.zoom, cx)
-            .child(look.editor.unwrap_or(url))
-            .into_any_element()
+        look.card.render(
+            node,
+            None,
+            Content::Flow(look.editor.unwrap_or(url)),
+            window,
+            cx,
+        )
     })
-    .edit(Field::new(
-        |node| node.url.clone().unwrap_or_default(),
-        |node, url| node.url = Some(url),
-    ))
+    .retained()
+    .exportable()
+    .edit(
+        Field::new(
+            |node| node.url.clone().unwrap_or_default(),
+            |node, url| node.url = Some(url),
+        )
+        .with_control(|_| Control::Url),
+    )
     .open(|node, cx| {
         if let Some(url) = &node.url {
             cx.open_url(url);
@@ -431,11 +611,10 @@ pub fn group() -> Kind {
 
 /// A type no kind names: its name, faint, in a card.
 pub fn unknown() -> Kind {
-    Kind::new(|node, look, _, cx| {
-        let name = label(node.kind.clone(), look.zoom, Theme::of(cx).text_faint);
-        chrome(Chrome::Card, node, look.zoom, cx)
-            .child(name)
-            .into_any_element()
+    Kind::new(|node, look, window, cx| {
+        let name = label(node.kind.clone(), look.card.zoom, Theme::of(cx).text_faint);
+        look.card
+            .render(node, None, Content::Flow(name), window, cx)
     })
 }
 
@@ -535,8 +714,16 @@ pub fn is_image(path: &str) -> bool {
 }
 
 fn file_under(root: Option<Rc<Path>>) -> Kind {
-    Kind::new(move |node, look, _, cx| {
+    Kind::new(move |node, look, window, cx| {
         let path = node.file.as_deref().unwrap_or_default();
+        if look.editor.is_none()
+            && let Some(image) = resolve(root.as_deref(), path).filter(|_| is_image(path))
+        {
+            return chrome(Chrome::Bare, node, look.card.zoom, cx)
+                .overflow_hidden()
+                .child(img(image).size_full().object_fit(ObjectFit::Contain))
+                .into_any_element();
+        }
         let content = match resolve(root.as_deref(), path).filter(|_| is_image(path)) {
             Some(image) => img(image)
                 .size_full()
@@ -544,37 +731,51 @@ fn file_under(root: Option<Rc<Path>>) -> Kind {
                 .into_any_element(),
             None => {
                 let subpath = node.subpath.as_deref().unwrap_or_default();
-                label(format!("{path}{subpath}"), look.zoom, Theme::of(cx).text)
+                label(
+                    format!("{path}{subpath}"),
+                    look.card.zoom,
+                    Theme::of(cx).text,
+                )
             }
         };
-        chrome(Chrome::Card, node, look.zoom, cx)
-            .child(look.editor.unwrap_or(content))
-            .into_any_element()
+        look.card.render(
+            node,
+            None,
+            Content::Flow(look.editor.unwrap_or(content)),
+            window,
+            cx,
+        )
     })
+    .exportable()
 }
 
 fn group_under(root: Option<Rc<Path>>) -> Kind {
     Kind::new(move |node, look, _, cx| {
-        let zoom = look.zoom;
+        let zoom = look.card.zoom;
         let backdrop = node
             .background
             .as_deref()
             .and_then(|path| resolve(root.as_deref(), path))
             .map(|image| {
+                if node.background_style.as_deref() == Some("repeat") {
+                    return TiledImage::new(image).scale(zoom).into_any_element();
+                }
                 let fit = match node.background_style.as_deref() {
                     Some("ratio") => ObjectFit::Contain,
                     _ => ObjectFit::Cover,
                 };
-                img(image).size_full().object_fit(fit)
+                img(image).size_full().object_fit(fit).into_any_element()
             });
         let title = node.label.clone().unwrap_or_default();
         chrome(Chrome::Frame, node, zoom, cx)
             .relative()
             .children(backdrop)
-            .when(!title.is_empty(), |d| {
+            .when(look.editor.is_none() && !title.is_empty(), |d| {
                 d.child(
                     div()
                         .text_style_at(TextStyle::Callout, zoom)
+                        .w(px(node.width as f32 * zoom))
+                        .text_ellipsis()
                         .absolute()
                         .left_0()
                         .bottom(px(node.height as f32 * zoom))
@@ -583,14 +784,26 @@ fn group_under(root: Option<Rc<Path>>) -> Kind {
                         .child(title),
                 )
             })
-            .children(look.editor)
+            .children(look.editor.map(|editor| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .bottom(px(node.height as f32 * zoom))
+                    .w(px(node.width as f32 * zoom))
+                    .pb(px(4. * zoom))
+                    .child(editor)
+            }))
             .into_any_element()
     })
+    .exportable()
     .holds()
-    .edit(Field::new(
-        |node| node.label.clone().unwrap_or_default(),
-        |node, label| node.label = Some(label),
-    ))
+    .edit(
+        Field::new(
+            |node| node.label.clone().unwrap_or_default(),
+            |node, label| node.label = Some(label),
+        )
+        .with_control(|_| Control::Name),
+    )
 }
 
 /// `path` under `root`, or as it is when absolute.
@@ -605,35 +818,45 @@ fn resolve(root: Option<&Path>, path: &str) -> Option<PathBuf> {
 }
 
 /// Parsed text kept between frames by node id, while its source holds.
-type Parsed = Rc<RefCell<HashMap<String, (String, Rc<Doc>)>>>;
+type Texts = HashMap<String, (String, Rc<Doc>)>;
+
+#[derive(Default)]
+struct Parsed(RefCell<Texts>);
 
 /// How many parsed texts are kept before they are all let go.
 const PARSED: usize = 4096;
 
+impl Parsed {
+    fn read(&self, node: &Node, cx: &App) -> Rc<Doc> {
+        let source = node.text.as_deref().unwrap_or_default();
+        {
+            let mut parsed = self.0.borrow_mut();
+            match parsed.get(&node.id) {
+                Some((was, doc)) if was == source => doc.clone(),
+                _ => {
+                    if parsed.len() >= PARSED {
+                        parsed.clear();
+                    }
+                    let doc = Rc::new(markdown::parse_with(source, &cx.marks()));
+                    parsed.insert(node.id.clone(), (source.to_owned(), doc.clone()));
+                    doc
+                }
+            }
+        }
+    }
+}
+
 fn render_text(
     parsed: &Parsed,
     node: &Node,
-    zoom: f32,
+    typography: Typography,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let source = node.text.as_deref().unwrap_or_default();
-    let doc = {
-        let mut parsed = parsed.borrow_mut();
-        match parsed.get(&node.id) {
-            Some((was, doc)) if was == source => doc.clone(),
-            _ => {
-                if parsed.len() >= PARSED {
-                    parsed.clear();
-                }
-                let doc = Rc::new(markdown::parse_with(source, &cx.marks()));
-                parsed.insert(node.id.clone(), (source.to_owned(), doc.clone()));
-                doc
-            }
-        }
-    };
+    let doc = parsed.read(node, cx);
     let editing = Editing {
-        typography: Some(cx.typography().scaled(zoom)),
+        typography: Some(typography),
+        text_color: node.text_color(Theme::of(cx)),
         ..Editing::default()
     };
     markdown::render_with(&doc, editing, window, cx)

@@ -12,12 +12,38 @@ impl CanvasView {
         }
     }
 
+    /// The content under a window position, including nodes between layout frames.
+    pub fn item_at(&self, position: Point<Pixels>) -> Option<Item> {
+        let at = self.canvas_point(position);
+        let canvas = self.editor.painted();
+        let containment = self.editor.painted_containment();
+        let node = canvas
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                let position = self
+                    .shown
+                    .get(&node.id)
+                    .copied()
+                    .unwrap_or((node.x as f32, node.y as f32));
+                at.x >= position.0
+                    && at.x <= position.0 + node.width as f32
+                    && at.y >= position.1
+                    && at.y <= position.1 + node.height as f32
+            })
+            .max_by_key(|(index, node)| (containment.depth(&node.id), *index));
+        node.map(|(_, node)| Item::Node(node.id.clone()))
+            .or_else(|| self.edge_at(position).map(Item::Edge))
+    }
+
     pub(super) fn pointer(&self, screen: Point<Pixels>, hit: Hit) -> Pointer {
         Pointer {
             screen,
             at: self.canvas_point(screen),
             button: MouseButton::Left,
-            modifiers: Modifiers::default(),
+            modifiers: self.modifiers,
+            space: self.space,
             clicks: 1,
             hit,
         }
@@ -34,13 +60,14 @@ impl CanvasView {
     ) {
         // A press inside what is being typed in belongs to the editor.
         let typing = self.editing.as_ref().is_some_and(|session| match &hit {
-            Hit::Node(id) => !session.edge && session.id == *id,
-            Hit::Edge(id) => session.edge && session.id == *id,
+            Hit::Node(id) => session.node_id() == Some(id.as_str()),
+            Hit::Edge(id) => session.edge_id() == Some(id.as_str()),
             _ => false,
         });
         if typing {
             return;
         }
+        self.modifiers = event.modifiers;
         self.stop_editing(window, cx);
         window.focus(&self.focus, cx);
         let pointer = Pointer {
@@ -69,14 +96,12 @@ impl CanvasView {
     pub(super) fn grant(&mut self, wish: Wish, window: &mut Window, cx: &mut Context<Self>) {
         match wish {
             Wish::Nothing => {}
+            Wish::ChooseConnection { from, handle, at } => {
+                cx.emit(CanvasEvent::ConnectionRequested { from, handle, at });
+            }
             Wish::Enter(id) => {
-                let node = self.editor.canvas().node(&id).cloned();
-                let open = node
-                    .as_ref()
-                    .and_then(|node| self.editor.kinds().get(&node.kind).open.clone());
-                match (open, node) {
-                    (Some(open), Some(node)) => open(&node, cx),
-                    _ => self.edit(id, None, window, cx),
+                if !self.open_node(&id, window, cx) {
+                    self.edit(id, None, window, cx);
                 }
             }
             Wish::EditEdge(id) => self.edit_edge(id, window, cx),
@@ -86,6 +111,47 @@ impl CanvasView {
                 self.edit(id, group, window, cx);
             }
         }
+    }
+
+    pub fn open_node(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.sync_document(cx);
+        let Some(node) = self.editor.canvas().node(id).cloned() else {
+            return false;
+        };
+        match self.editor.kinds().get(&node.kind).open.clone() {
+            Some(kind::Open::Direct(open)) => open(&node, cx),
+            Some(kind::Open::Host) => cx.emit(CanvasEvent::OpenRequested { id: id.to_owned() }),
+            None => return false,
+        }
+        self.stop_editing(window, cx);
+        true
+    }
+
+    pub(super) fn request_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_editing(window, cx);
+        self.sync_document(cx);
+        let item = self.item_at(event.position);
+        match &item {
+            Some(Item::Node(id)) if !self.editor.selected_nodes().contains(&id.as_str()) => {
+                self.update_editor(cx, |editor| editor.select(Some(id.clone())));
+            }
+            Some(Item::Edge(id)) => {
+                self.update_editor(cx, |editor| editor.select_edge(Some(id.clone())));
+            }
+            _ => {}
+        }
+        window.focus(&self.focus, cx);
+        cx.emit(CanvasEvent::ContextMenu {
+            position: event.position,
+            at: self.canvas_point(event.position),
+            item,
+        });
+        cx.stop_propagation();
     }
 
     /// Hand the held tool where the pointer is now.
@@ -140,34 +206,8 @@ impl CanvasView {
         self.editor.node_under(at, &from).map(str::to_owned)
     }
 
-    /// Where an edge runs: its route while both its nodes sit where the
-    /// document puts them, else as its kind draws it.
-    pub(super) fn path_of(
-        &self,
-        nodes: &HashMap<&str, &Node>,
-        shown: &Positions,
-        edge: &Edge,
-    ) -> Option<Path> {
-        let ends = ends_of(nodes, shown, edge, self.editor.kinds())?;
-        let settled = |id: &str| {
-            let node = nodes.get(id);
-            shown.get(id).is_none_or(|&(x, y)| {
-                node.is_some_and(|node| (x, y) == (node.x as f32, node.y as f32))
-            })
-        };
-        let routed = (settled(&edge.from_node) && settled(&edge.to_node))
-            .then(|| path::route(&ends, &edge.points))
-            .flatten();
-        Some(routed.unwrap_or_else(|| (self.editor.edge_kinds().get(edge).path)(&ends)))
-    }
-
     /// The handles the picked edge's kind declares, along its path.
-    pub(super) fn edge_handles(
-        &self,
-        theme: &Theme,
-        shown: &Positions,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    pub(super) fn edge_handles(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(id) = self.editor.selected_edge().map(str::to_owned) else {
             return Vec::new();
         };
@@ -175,11 +215,10 @@ impl CanvasView {
             return Vec::new();
         }
         let canvas = self.editor.painted();
-        let nodes = canvas.lookup();
         let Some(edge) = canvas.edge(&id) else {
             return Vec::new();
         };
-        let Some(path) = self.path_of(&nodes, shown, edge) else {
+        let Some(path) = self.geometry.paths.get(&edge.id) else {
             return Vec::new();
         };
         let (z, pan) = (self.editor.zoom(), self.editor.pan());
@@ -187,7 +226,7 @@ impl CanvasView {
             .into_iter()
             .filter(|declared| matches!(declared.role, Role::Reconnect(_)))
             .filter_map(|declared| {
-                let at = declared.spot.along(&path)?;
+                let at = declared.spot.along(path)?;
                 let (x, y) = (pan.x + at.x * z, pan.y + at.y * z);
                 let owner = id.clone();
                 Some(
@@ -226,14 +265,15 @@ impl CanvasView {
         let at = self.canvas_point(position);
         let zoom = self.editor.zoom();
         let canvas = self.editor.painted();
-        let nodes = canvas.lookup();
         canvas
             .edges
             .iter()
             .rev()
             .find(|edge| {
                 let reach = self.editor.edge_kinds().get(edge).reach / zoom;
-                self.path_of(&nodes, &self.shown, edge)
+                self.geometry
+                    .paths
+                    .get(&edge.id)
                     .is_some_and(|path| path.distance(at) <= reach)
             })
             .map(|edge| edge.id.clone())
@@ -270,6 +310,7 @@ impl CanvasView {
             self.lift(event.position, window, cx);
             return;
         }
+        self.modifiers = event.modifiers;
         self.aim = Some(event.position);
         self.feed(event.position, cx);
     }
