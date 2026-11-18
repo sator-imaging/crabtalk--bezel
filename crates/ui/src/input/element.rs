@@ -287,7 +287,7 @@ impl Render for TextField {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll_wheel))
             .w_full()
             .when(self.shape == Shape::Fill, |field| field.h_full())
             .when(self.frame, |field| {
@@ -309,7 +309,7 @@ impl Render for TextField {
             .text_size(px(self.metrics.size()))
             .font_weight(self.metrics.weight)
             .line_height(px(self.metrics.line_height()))
-            .text_color(theme.text)
+            .text_color(self.text_color.unwrap_or(theme.text))
             .child(TextFieldElement { field: cx.entity() })
             .children(self.edit_menu(_window, cx))
     }
@@ -348,14 +348,6 @@ struct Covered {
     /// The top left of its slot.
     at: Point<Pixels>,
     color: gpui::Hsla,
-}
-
-impl IntoElement for TextFieldElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for TextFieldElement {

@@ -6,7 +6,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -64,4 +63,4 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # `TestAppContext` and `Window::simulate_next_frame` — a window and a clock
 # without a display, which is what lets frame counts be asserted.
-gpui = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support", "bench-support"] }

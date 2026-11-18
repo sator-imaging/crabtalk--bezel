@@ -31,17 +31,17 @@
 //! }))
 //! ```
 
-use std::cmp::Ordering;
-
+use crate::{
+    surface::Control,
+    widgets::{self, Buttons as _},
+};
 use gpui::{
     AnyElement, BoxShadow, Div, ElementId, Hsla, SharedString, Stateful, StyleRefinement, div,
     point, prelude::*, px,
 };
-
 use icons::Icon;
+use std::cmp::Ordering;
 use theme::{TextStyle, Theme, Typeset};
-
-use crate::widgets::{self, Buttons as _};
 
 mod bar;
 mod reorder;
@@ -371,8 +371,7 @@ pub const MAX_WIDTH: f32 = 180.0;
 /// The narrowest a tab on a [`Track`] gets before its strip scrolls.
 pub const TRACK_MIN_WIDTH: f32 = 120.0;
 
-/// How tall a [`Track`] stands. Its tabs fill it inside its border and
-/// [`TRACK_PAD`].
+/// The height callers reserve for a tab track.
 pub const TRACK_HEIGHT: f32 = 30.0;
 
 /// The padding between a [`Track`]'s border and its tabs.
@@ -411,12 +410,7 @@ pub fn bar(id: impl Into<ElementId>) -> TabBar {
 /// Every tab but a [`State::Focused`] one takes its own `hover`, and gpui panics
 /// on a second one: reach for [`Close::OnHover`]'s group, or a `group_hover` of
 /// your own, rather than chaining `.hover(..)` onto what this returns.
-pub fn tab(
-    theme: &Theme,
-    key: impl Into<SharedString>,
-    label: Label,
-    state: State,
-) -> Stateful<Div> {
+pub fn tab(theme: &Theme, key: impl Into<SharedString>, label: Label, state: State) -> Control {
     let key = key.into();
     let group = group_of(&key);
     let tint = state.tint(theme);
@@ -469,26 +463,29 @@ pub fn tab(
 /// slot, the label's ink for `state`, and the selected wash and ring while
 /// [`State::Focused`]. What [`tab`] is drawn on, for a label that is not a
 /// [`Label`].
-pub fn chip(theme: &Theme, state: State) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(Theme::BUTTON_HEIGHT))
-        .px(px(TAB_PAD))
-        .rounded(px(Theme::control_radius()))
-        // The slot `focus::focusable` fills, kept whether or not it is filled:
-        // gpui sizes border-box, so a border that arrived with the ring would
-        // shift the label by a pixel.
-        .border_1()
-        .border_color(widgets::RING_SLOT)
-        .text_style(TextStyle::Callout)
-        .text_color(state.tint(theme))
-        .when(state == State::Focused, |el| {
-            el.bg(theme.card_selected_bg())
-                .shadow(theme::glass_selected_shadows())
-        })
+pub fn chip(theme: &Theme, state: State) -> Control {
+    Control::new(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(Theme::BUTTON_HEIGHT))
+            .px(px(TAB_PAD))
+            .rounded(px(Theme::control_radius()))
+            // The slot `focus::focusable` fills, kept whether or not it is filled:
+            // gpui sizes border-box, so a border that arrived with the ring would
+            // shift the label by a pixel.
+            .border_1()
+            .border_color(widgets::RING_SLOT)
+            .text_style(TextStyle::Callout)
+            .text_color(state.tint(theme))
+            .when(state == State::Focused, |el| {
+                el.bg(theme.card_selected_bg())
+                    .shadow(theme::glass_selected_shadows())
+            }),
+        state == State::Focused,
+    )
 }
 
 /// A tab's `×`, for the `key` its [`tab`] was built with. The click is the

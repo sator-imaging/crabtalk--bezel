@@ -15,6 +15,7 @@ use crate::{
     icons,
     input::{FieldEvent, TextField},
     keys, popover, scroll,
+    surface::Control,
     tooltip::Tooltip,
 };
 use gpui::{
@@ -33,6 +34,7 @@ const SEGMENT_GLYPH: f32 = 16.0;
 
 /// How many rows a searchable submenu shows before it scrolls.
 const SEARCH_ROWS: f32 = 10.0;
+const DEFAULT_ROWS: usize = 12;
 
 actions!(
     bezel_menu,
@@ -65,6 +67,35 @@ pub(crate) fn indent(cx: &App) -> MenuIndent {
 /// Changes the step and repaints open windows.
 pub(crate) fn set_indent(indent: MenuIndent, cx: &mut App) {
     cx.set_global(indent);
+    cx.refresh_windows();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuHeight {
+    pub rows: usize,
+}
+
+impl Default for MenuHeight {
+    fn default() -> Self {
+        Self { rows: DEFAULT_ROWS }
+    }
+}
+
+impl MenuHeight {
+    pub fn limit(self, available: Pixels) -> Pixels {
+        px(self.rows.max(1) as f32 * popover::menu_row_height() + 2. * popover::MENU_PAD)
+            .min(available.max(Pixels::ZERO))
+    }
+}
+
+impl Global for MenuHeight {}
+
+pub(crate) fn height(cx: &App) -> MenuHeight {
+    cx.try_global::<MenuHeight>().copied().unwrap_or_default()
+}
+
+pub(crate) fn set_height(height: MenuHeight, cx: &mut App) {
+    cx.set_global(height);
     cx.refresh_windows();
 }
 
@@ -359,8 +390,8 @@ impl Item {
     ///
     /// Still nothing to dispatch: the row's click stays the caller's, and the
     /// action passed here is read, never run.
-    pub fn with_shortcut(self, action: &dyn Action, window: &Window) -> Self {
-        match keys::shortcut(action, window) {
+    pub fn with_shortcut(self, action: &dyn Action, window: &Window, cx: &App) -> Self {
+        match keys::shortcut(action, window, cx) {
             Some(keystroke) => self.with_keystroke(keystroke),
             None => self,
         }
@@ -370,8 +401,14 @@ impl Item {
     /// focused — which is most menu rows, since opening the menu took focus
     /// off whatever the row acts on. `context` is the one the binding was
     /// scoped to (`editor::CONTEXT`, [`crate::input::KEY_CONTEXT`]).
-    pub fn with_shortcut_in(self, action: &dyn Action, context: &str, window: &Window) -> Self {
-        match keys::shortcut_in(action, context, window) {
+    pub fn with_shortcut_in(
+        self,
+        action: &dyn Action,
+        context: &str,
+        window: &Window,
+        cx: &App,
+    ) -> Self {
+        match keys::shortcut_in(action, context, window, cx) {
             Some(keystroke) => self.with_keystroke(keystroke),
             None => self,
         }
@@ -740,18 +777,22 @@ pub fn edit_items(
     pasteable: bool,
     actions: [&dyn Action; 4],
     window: &Window,
+    cx: &App,
 ) -> Vec<Item> {
     let [cut, copy, paste, select_all] = actions;
     let enable = |item: Item, on: bool| item.disabled(!on);
     vec![
-        enable(Item::action("Cut").with_shortcut(cut, window), selected),
-        enable(Item::action("Copy").with_shortcut(copy, window), selected),
+        enable(Item::action("Cut").with_shortcut(cut, window, cx), selected),
         enable(
-            Item::action("Paste").with_shortcut(paste, window),
+            Item::action("Copy").with_shortcut(copy, window, cx),
+            selected,
+        ),
+        enable(
+            Item::action("Paste").with_shortcut(paste, window, cx),
             pasteable,
         ),
         Item::Separator,
-        Item::action("Select All").with_shortcut(select_all, window),
+        Item::action("Select All").with_shortcut(select_all, window, cx),
     ]
 }
 
@@ -766,9 +807,8 @@ pub fn edit_items(
 /// [`popover::menu_at`], …). Childed bare, it paints in flow, under every
 /// later sibling. Submenu panels are anchored here.
 ///
-/// Every panel is capped at the window's height less the snap margin either
-/// side, and scrolls its rows past that. A submenu hangs off its row wherever
-/// the row has scrolled to, outside the parent's clip.
+/// Panels scroll past [`MenuHeight`]'s limit. A submenu hangs off its row
+/// wherever the row has scrolled to, outside the parent's clip.
 ///
 /// The pointer moves the cursor rather than lighting a row of its own, so a
 /// submenu can only ever hang off the row that is live. Everything the pointer
@@ -882,7 +922,7 @@ impl<V: 'static> Tree<V> {
             }
         }
         let inset = px(popover::SNAP) + window.client_inset().unwrap_or(Pixels::ZERO);
-        let cap = window.viewport_size().height - inset * 2.0;
+        let cap = height(cx).limit(window.viewport_size().height - inset * 2.0);
         // A menu where nothing carries a glyph keeps no room for one — a bar's
         // menus would otherwise open with an empty column down their left.
         let gutter = items.iter().any(Item::has_icon);
@@ -1028,6 +1068,7 @@ impl<V: 'static> Tree<V> {
             .p_0()
             .flex()
             .flex_col()
+            .min_h_0()
             .max_h(cap)
             .map(|card| match (described, width.described) {
                 (true, Described::Fixed(wide)) => card.w(wide),
@@ -1199,7 +1240,7 @@ impl<V: 'static> Tree<V> {
                     (true, true) => theme.text,
                     (true, false) => theme.text_muted,
                 };
-                let cell = div()
+                let cell = Control::new(div(), chosen)
                     .id(row_id(&self.id, &path))
                     .flex_1()
                     .min_w_0()
