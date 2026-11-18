@@ -222,6 +222,10 @@ pub struct Theme {
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
+    /// Canvas workspace background.
+    pub canvas_bg: Hsla,
+    /// Canvas background grid dots.
+    pub canvas_grid: Hsla,
 
     // ---- paint: text ----
     /// Primary text. Translucent, like `text_muted` and `text_faint`: the
@@ -391,7 +395,7 @@ pub struct Theme {
     /// wash.
     pub drop_preview: SurfaceStyle,
     /// What a dragged item's floating copy paints on — see
-    /// `ui::drag::Carried::ghost`.
+    /// `ui::drag::ghost`.
     pub carried_surface: SurfaceStyle,
     /// Lens displacement amplitude, signed; negative inverts it.
     pub glass_magnify: f32,
